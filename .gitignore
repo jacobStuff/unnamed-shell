@@ -1,0 +1,11 @@
+build/
+build-*/
+cmake-build-*/
+*.o
+*.obj
+*.out
+compile_commands.json
+.cache/
+.DS_Store
+CTestTestfile.cmake
+_deps/
