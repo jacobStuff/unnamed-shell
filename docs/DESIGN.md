@@ -163,6 +163,21 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   (not a clean integer), not as 5. Some shells (bash) do this chasing;
   ush's arithmetic evaluator treats an unset-or-non-numeric variable as 0
   and stops there.
+- **A trailing IFS delimiter never produces a trailing empty field**,
+  whether it's whitespace or a non-whitespace IFS character - `a:` with
+  `IFS=:` splits to just `["a"]`, not `["a", ""]`. This matches ush's
+  best-effort recollection of real shell behavior (confidently verified:
+  leading whitespace is trimmed and never produces a leading field, and a
+  leading *non-whitespace* delimiter does; less independently verified:
+  that the trailing case is fully symmetric for non-whitespace
+  delimiters). Internal empty fields between two non-whitespace
+  delimiters (`a::b` -> `["a", "", "b"]`) are on solid ground either way.
+- **Pathname expansion doesn't track `set -f`/`noglob`** (no `set` builtin
+  exists yet to set it) - globbing is always attempted when a pattern has
+  an unquoted metacharacter. Also doesn't special-case a pattern's
+  trailing `/` to require the match be a directory - matches still must
+  be directories to serve as a *non-final* path component, but a trailing
+  slash on the pattern itself currently has no extra effect.
 - **Here-document delimiter quote-removal** (`Parser::flattenSimpleWord`)
   only handles delimiters built from literal text and quoting; a delimiter
   word containing a live `$`/`` ` ``/arithmetic expansion contributes no
@@ -217,19 +232,34 @@ expansion stage can detect by inspecting the first `Literal` part directly.
              as opaque strings (`${...}` operands, `$((...))` bodies) -
              see "Known hard corners" below for the two new lexer entry
              points and what each treats as special.
-       - [ ] Field splitting (§2.6.5, using `IFS`) - consumes
-             `ExpandedWord`/`fieldBreakAfter` from the expander above.
+       - [x] `src/expand/field_split.cpp` - field splitting (§2.6.5): a
+             character-level delimiter state machine over `IFS` (the
+             whitespace-vs-"other" IFS character distinction, adjacent-
+             whitespace absorption into a single delimiter, leading-
+             whitespace trim, and the null-field-removal rule), run
+             independently on each `fieldBreakAfter`-delimited segment of
+             an `ExpandedWord` so `$@` still gets its guaranteed
+             per-parameter boundaries regardless of `IFS`.
+       - [x] `src/expand/pathname_expand.cpp` - pathname expansion
+             (§2.6.6), via `fnmatch(3)` for pattern matching
+             (`src/expand/pattern.cpp`) and `opendir`/`readdir` for
+             directory walking (real POSIX C-library APIs, not shell
+             source - revised from an earlier note about reimplementing
+             glob semantics from scratch, since fnmatch(3) already *is*
+             the POSIX spec for this, just as libc's fork/exec/waitpid are
+             for process management). Handles multi-component patterns
+             (`a*/b?/*.txt`), the leading-dot/hidden-file rule, sorted
+             results, and "no match -> left unchanged" - and is careful to
+             `stat()` (follow symlinks) rather than `lstat()` when
+             checking whether an intermediate path component is
+             traversable, since e.g. macOS's `/var` is itself a symlink.
+       - [x] Quote removal (§2.6.7) - `flatten()` in expander.hpp, since
+             the representation never carries quote characters to begin
+             with (see "Word representation" above).
        - [ ] Command substitution needs a real (if initially minimal)
              executor plugged in as a `CommandRunner` to do anything; this
-             is what pulls the executor into scope next.
-       - [ ] Pathname expansion (§2.6.6) - current plan: use `fnmatch(3)`
-             for pattern matching and `opendir`/`readdir` for directory
-             walking (both real POSIX C-library APIs, not shell source) -
-             revised from the original "reimplement glob semantics from
-             scratch" note, since fnmatch(3) already *is* the POSIX spec
-             for this, just as libc's fork/exec/waitpid are for process
-             management.
-       - [ ] Quote removal (§2.6.7)
+             is what pulls the executor into scope next - the last piece
+             of §2.6, and everything else in the pipeline besides.
 5. [ ] Executor (§2.9) - simple command exec (fork/exec/PATH search),
        pipelines, `&&`/`||`/`;`/`&` lists, compound commands, subshells,
        redirection setup (§2.7), exit status rules, `$?`/`$$`/`$!`/`$#`/`$@`/

@@ -33,6 +33,8 @@ add_library(ush_expand STATIC
     expand/arithmetic.cpp
     expand/pattern.cpp
     expand/expander.cpp
+    expand/field_split.cpp
+    expand/pathname_expand.cpp
 )
 target_include_directories(ush_expand PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ush_expand PUBLIC ush_runtime ush_lexer)

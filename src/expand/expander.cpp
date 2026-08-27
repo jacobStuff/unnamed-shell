@@ -22,26 +22,6 @@ bool isValidVariableName(const std::string& s) {
     return true;
 }
 
-// Builds an fnmatch(3)-compatible pattern from an ExpandedWord: characters
-// from a quoted piece are backslash-escaped (making them literal, per
-// §2.13's rule that quoting removes a pattern character's special
-// meaning), characters from an unquoted piece pass through so `* ? [...]`
-// keep their glob meaning.
-std::string toFnmatchPattern(const ExpandedWord& w) {
-    std::string pat;
-    for (const auto& piece : w) {
-        if (piece.quoted) {
-            for (char c : piece.text) {
-                pat += '\\';
-                pat += c;
-            }
-        } else {
-            pat += piece.text;
-        }
-    }
-    return pat;
-}
-
 // Finds the shortest (largest=false) or longest (largest=true) prefix of
 // `value` matched in its entirety by `pattern`, and returns `value` with
 // that prefix removed (or `value` unchanged if no prefix matches at all,
@@ -354,7 +334,7 @@ void Expander::expandParameter(const std::string& raw, ExpandedWord& out) {
         case Op::Percent:
         case Op::PercentPercent: {
             std::string base = value.value_or("");
-            std::string pattern = toFnmatchPattern(expandOperandWord(operandRaw));
+            std::string pattern = buildPattern(expandOperandWord(operandRaw)).pattern;
             bool largest = (op == Op::HashHash || op == Op::PercentPercent);
             std::string result = (op == Op::Hash || op == Op::HashHash)
                                       ? trimMatchedPrefix(base, pattern, largest)
