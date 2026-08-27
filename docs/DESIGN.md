@@ -115,24 +115,50 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   is a follow-up.
 - **Alias substitution** (§2.3.1) interacts with tokenizing (an alias is
   substituted and the result re-lexed at the point the command-name word is
-  recognized). Deferred until the parser exists, since it needs grammar
-  context (is this word in command-name position?).
+  recognized). Still deferred (now that the parser exists, this would slot
+  into `Parser::parseSimpleCommand`, expanding the command-name word and
+  re-parsing before it's used) - not yet needed since nothing executes yet.
 - **Reserved words** are only reserved when totally unquoted *and* in a
   grammar position where a reserved word is expected (e.g. command-name
   position, or right after `do`). The lexer never decides this; it just
   tells the parser whether a WORD token was produced from a single,
   entirely-unquoted `Literal` part (`Token::couldBeReservedWord`), and the
   parser checks that string against the reserved word set only where the
-  grammar allows it.
+  grammar allows it. **Simplification:** ush recognizes a reserved word
+  only as the very first token of a `command`, before any leading
+  redirects or assignment-words have been consumed. Strict POSIX arguably
+  allows a leading redirect (but never an assignment-word) to still permit
+  the following word to be recognized as reserved (e.g. `>f if ...; fi`);
+  ush treats anything after a command's first token as never reserved,
+  which matches every real shell once an assignment-word has been consumed
+  (`FOO=bar if` runs a program named `if`) and is a clean, defensible
+  choice for the redirect case too - which is vanishingly rare in real
+  scripts. See the comment on `Parser` in `src/parser/parser.hpp`.
+- **`for` loop separator leniency.** The strict grammar only allows a
+  linebreak (never a `;`) between `for name` and a bare `do` (no `in`
+  clause), and only allows that linebreak when an `in` clause *does*
+  follow. ush accepts a `;` and/or a linebreak in both cases, matching
+  real-world shell behavior for `for i; do ... done` and
+  `for i\ndo ... done`.
+- **Here-document delimiter quote-removal** (`Parser::flattenSimpleWord`)
+  only handles delimiters built from literal text and quoting; a delimiter
+  word containing a live `$`/`` ` ``/arithmetic expansion contributes no
+  text for those parts. This is spec-adjacent (such a delimiter is
+  nonsensical/undefined in real usage) and not expected to matter in
+  practice.
 
 ## Status / roadmap
 
 1. [x] Project scaffold (CMake, Catch2, directory layout).
 2. [x] Lexer (§2.2, §2.3, §2.10.1) - tokens, quoting, operators, IO_NUMBER,
        comments, command/param/arith substitution scanning.
-3. [ ] Parser (§2.10.2) - AST for lists/pipelines/simple & compound
-       commands/redirections/here-docs, reserved-word handling, here-doc
-       body extraction (needs raw-line access back into the lexer's input).
+3. [x] Parser (§2.10.2) - AST (`src/ast/ast.hpp`) for lists/pipelines/
+       simple & compound commands (brace group, subshell, `for`, `case`,
+       `if`/`elif`/`else`, `while`, `until`, function definitions)/
+       redirections/here-docs, contextual reserved-word handling, here-doc
+       body extraction wired through `Lexer::consumeHeredocBody` and
+       `Parser::advance`. See the "known hard corners" above for the two
+       documented leniencies. 49 Catch2 test cases covering the grammar.
 4. [ ] Expansion (§2.6) - tilde, parameter, command sub execution, arithmetic
        (§2.6.4, a small recursive-descent arithmetic evaluator over `intmax_t`),
        field splitting (§2.6.5, `IFS`), pathname expansion (§2.6.6, `glob(3)`

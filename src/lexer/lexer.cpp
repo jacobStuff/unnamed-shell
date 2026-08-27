@@ -211,6 +211,34 @@ Token Lexer::lexWordOrIoNumber() {
 }
 
 // ---------------------------------------------------------------------
+// here-document bodies (§2.7.4)
+// ---------------------------------------------------------------------
+
+std::string Lexer::consumeHeredocBody(const std::string& delimiter, bool stripLeadingTabs) {
+    std::string body;
+    while (true) {
+        std::string line;
+        while (!atEnd() && peekChar() != '\n') line += advanceChar();
+        bool hadNewline = !atEnd();  // current char (if any) is the '\n'
+        if (hadNewline) advanceChar();
+
+        if (stripLeadingTabs) {
+            std::size_t i = 0;
+            while (i < line.size() && line[i] == '\t') ++i;
+            line.erase(0, i);
+        }
+
+        if (line == delimiter) return body;
+
+        if (!hadNewline) {
+            errorAt("unterminated here-document: missing delimiter '" + delimiter + "'", here());
+        }
+        body += line;
+        body += '\n';
+    }
+}
+
+// ---------------------------------------------------------------------
 // word scanning
 // ---------------------------------------------------------------------
 

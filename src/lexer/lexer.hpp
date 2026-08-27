@@ -39,6 +39,23 @@ public:
     // after that).
     Token next();
 
+    // Reads a here-document body (§2.7.4): consumes whole lines up to and
+    // including the first line that equals `delimiter` (after stripping
+    // leading tabs from it too, when `stripLeadingTabs` is set), and
+    // returns everything before that line (with leading tabs stripped from
+    // each line when `stripLeadingTabs` is set). The delimiter line need
+    // not end in a newline if it's the last thing in the input.
+    //
+    // Precondition: the lexer's position is exactly at the start of a
+    // line, i.e. this is called right after Lexer::next() has produced a
+    // NEWLINE token (or, transitively, right after a previous
+    // consumeHeredocBody() call, for back-to-back here-documents on one
+    // line). See docs/DESIGN.md and Parser::advance().
+    //
+    // Throws LexError if the delimiter line is never found before the end
+    // of input.
+    std::string consumeHeredocBody(const std::string& delimiter, bool stripLeadingTabs);
+
 private:
     std::string src_;
     std::size_t pos_ = 0;
