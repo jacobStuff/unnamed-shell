@@ -363,4 +363,12 @@ std::intmax_t Expander::evaluateArithmeticExpansion(const std::string& rawExpr) 
     return evaluateArithmetic(flatten(ew), env_);
 }
 
+std::string Expander::expandHeredocBody(const std::string& rawBody) {
+    Lexer lex(rawBody);
+    Word w = lex.scanExpansionsUntilEnd();
+    ExpandedWord ew;
+    expandPartsInto(w, 0, ew);  // same reasoning as evaluateArithmeticExpansion() above
+    return flatten(ew);
+}
+
 }  // namespace ush

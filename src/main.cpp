@@ -1,73 +1,74 @@
-// Placeholder entry point.
+// ush entry point.
 //
-// ush doesn't have a parser or executor yet (see docs/DESIGN.md for the
-// roadmap). Until they exist, this reads the whole of stdin and prints the
-// token stream the lexer produces, so the lexer can be exercised end-to-end
-// from the command line while the rest of the pipeline is built out.
+// Supports non-interactive use only so far (see docs/DESIGN.md roadmap
+// item 8 - a real interactive prompt/line-editing loop is still to
+// come):
+//   ush -c 'command string' [name [arg...]]
+//   ush script [arg...]
+//   ush                        (reads the whole script from stdin)
+//
+// In every form, the whole input is read and parsed as one program
+// before execution begins (no line-by-line interactive parsing yet).
 
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
+#include "ast/ast.hpp"
+#include "exec/executor.hpp"
 #include "lexer/lexer.hpp"
-#include "lexer/token.hpp"
+#include "parser/parser.hpp"
+#include "runtime/environment.hpp"
 
 namespace {
 
-std::string wordToDebugString(const ush::Word& word);
-
-std::string wordPartToDebugString(const ush::WordPart& part) {
-    using ush::WordPartKind;
-    switch (part.kind) {
-        case WordPartKind::Literal:
-            return part.text;
-        case WordPartKind::SingleQuoted:
-            return "'" + part.text + "'";
-        case WordPartKind::DoubleQuoted:
-            return "\"" + wordToDebugString(part.parts) + "\"";
-        case WordPartKind::ParamExpansion:
-            return "${" + part.text + "}";
-        case WordPartKind::CommandSubDollar:
-            return "$(" + part.text + ")";
-        case WordPartKind::CommandSubBacktick:
-            return "`" + part.text + "`";
-        case WordPartKind::ArithExpansion:
-            return "$((" + part.text + "))";
-    }
-    return "";
-}
-
-std::string wordToDebugString(const ush::Word& word) {
-    std::string out;
-    for (const auto& part : word) out += wordPartToDebugString(part);
-    return out;
+std::string readAll(std::istream& in) {
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
 }
 
 }  // namespace
 
-int main() {
-    std::ostringstream buf;
-    buf << std::cin.rdbuf();
+int main(int argc, char** argv) {
+    std::string source;
+    std::string shellName = "ush";
+    std::vector<std::string> scriptArgs;
 
-    ush::Lexer lexer(buf.str());
-    for (;;) {
-        ush::Token tok;
-        try {
-            tok = lexer.next();
-        } catch (const ush::LexError& e) {
-            std::cerr << "ush: lex error at line " << e.location().line << ", column "
-                      << e.location().column << ": " << e.what() << '\n';
-            return 1;
+    if (argc >= 3 && std::string(argv[1]) == "-c") {
+        source = argv[2];
+        shellName = argc >= 4 ? argv[3] : "ush";
+        for (int i = 4; i < argc; ++i) scriptArgs.emplace_back(argv[i]);
+    } else if (argc >= 2) {
+        std::ifstream f(argv[1]);
+        if (!f) {
+            std::cerr << "ush: " << argv[1] << ": No such file or directory\n";
+            return 127;
         }
-        if (tok.type == ush::TokenType::EndOfInput) break;
-
-        std::cout << ush::tokenTypeName(tok.type);
-        if (tok.type == ush::TokenType::Word) {
-            std::cout << "(" << wordToDebugString(tok.word) << ")";
-        } else if (tok.type == ush::TokenType::IoNumber) {
-            std::cout << "(" << tok.ioNumberText << ")";
-        }
-        std::cout << '\n';
+        source = readAll(f);
+        shellName = argv[1];
+        for (int i = 2; i < argc; ++i) scriptArgs.emplace_back(argv[i]);
+    } else {
+        source = readAll(std::cin);
     }
-    return 0;
+
+    ush::Environment env(shellName);
+    env.setPositionalParams(scriptArgs);
+    ush::Executor executor(env);
+
+    ush::ast::List program;
+    try {
+        ush::Parser parser(source);
+        program = parser.parseProgram();
+    } catch (const ush::LexError& e) {
+        std::cerr << "ush: syntax error: " << e.what() << '\n';
+        return 2;
+    } catch (const ush::ParseError& e) {
+        std::cerr << "ush: syntax error: " << e.what() << '\n';
+        return 2;
+    }
+
+    return executor.runProgram(program);
 }

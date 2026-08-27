@@ -40,7 +40,17 @@ target_include_directories(ush_expand PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ush_expand PUBLIC ush_runtime ush_lexer)
 target_compile_features(ush_expand PUBLIC cxx_std_20)
 
+# ush_exec: the executor (§2.9, §2.7, §2.12) and built-in utilities
+# (§2.14 special built-ins, plus a practical subset of regular ones).
+add_library(ush_exec STATIC
+    exec/executor.cpp
+    exec/builtins.cpp
+)
+target_include_directories(ush_exec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ush_exec PUBLIC ush_parser ush_expand)
+target_compile_features(ush_exec PUBLIC cxx_std_20)
+
 add_executable(ush
     main.cpp
 )
-target_link_libraries(ush PRIVATE ush_parser ush_expand)
+target_link_libraries(ush PRIVATE ush_exec)

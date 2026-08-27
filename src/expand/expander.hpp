@@ -85,6 +85,13 @@ public:
     // not performed here - see the file header comment.
     ExpandedWord expand(const Word& word);
 
+    // Expands the raw body text of a non-literal (unquoted-delimiter)
+    // here-document (§2.7.4): the same rules as $((...)) pre-expansion -
+    // only $ / ` are special, tilde expansion does NOT apply - followed
+    // by quote removal. The executor should use a literal here-document's
+    // body unchanged instead of calling this.
+    std::string expandHeredocBody(const std::string& rawBody);
+
 private:
     Environment& env_;
     CommandRunner* runner_;

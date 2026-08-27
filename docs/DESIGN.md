@@ -146,9 +146,10 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   text was already delimited by balanced braces/parens) for `${...}`
   operands, and `Lexer::scanExpansionsUntilEnd()` (double-quote-body rules
   - only `$`/`` ` ``/backslash-before-`$ ` " \` are special, quote
-  characters are literal) for `$((...))` pre-expansion and (not yet wired
-  up - needs the executor) unquoted here-document bodies, both of which
-  spec says undergo "the same expansions as double-quoted text".
+  characters are literal) for `$((...))` pre-expansion and (now wired up
+  in `Executor::applyOneRedirect`, via `Expander::expandHeredocBody`)
+  unquoted here-document bodies, both of which spec says undergo "the
+  same expansions as double-quoted text".
 - **`${#}` (braced, nothing between `#` and `}`)** is treated as the
   special parameter `#` (positional parameter count, same as bare `$#`)
   rather than "the length of a parameter with an empty name" - the latter
@@ -184,6 +185,32 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   text for those parts. This is spec-adjacent (such a delimiter is
   nonsensical/undefined in real usage) and not expected to matter in
   practice.
+- **fork(2) and libc stdio buffering.** A real bug the integration tests
+  caught: a builtin's `printf`/`fputs` output can sit unflushed in libc's
+  stdio buffer; if a *later* `fork()` happens before it's flushed, the
+  child inherits a copy of that buffered data, and whenever the child's
+  own stdio buffers eventually flush (any normal exit path does), it
+  re-emits the parent's leftover bytes too - duplicated, misordered
+  output. Fixed by flushing (`fflush(nullptr)`) immediately before every
+  `fork()` call in `executor.cpp`, not by avoiding buffered I/O.
+- **Pipeline stages that are external programs or nested subshells fork
+  twice**, not once: `runCommand()` is written to be safe to call from
+  any process context (see its header comment), so a pipeline forks once
+  per stage and, if that stage happens to itself need a fork (an external
+  program, or a subshell), `runCommand()` forks again inside the already-
+  forked child. This is a deliberate simplicity-over-efficiency choice,
+  not a correctness issue - real shells avoid the second fork for the
+  common case, ush doesn't yet.
+- **A readonly-variable assignment failure doesn't abort the whole
+  (non-interactive) script**, only the one command that attempted it -
+  `Executor::trySetVar` catches `ReadonlyVariableError` and reports it,
+  rather than letting it propagate as an uncaught C++ exception (which,
+  before this was added, crashed the entire shell process via
+  `std::terminate` on the very first readonly violation - caught by the
+  integration tests, not a unit test, since it required actually running
+  a script through the executor). Strict POSIX says a variable-assignment
+  error should exit a non-interactive shell entirely; ush's softer
+  behavior is a documented simplification.
 
 ## Status / roadmap
 
@@ -260,26 +287,47 @@ expansion stage can detect by inspecting the first `Literal` part directly.
              executor plugged in as a `CommandRunner` to do anything; this
              is what pulls the executor into scope next - the last piece
              of §2.6, and everything else in the pipeline besides.
-5. [ ] Executor (§2.9) - simple command exec (fork/exec/PATH search),
-       pipelines, `&&`/`||`/`;`/`&` lists, compound commands, subshells,
-       redirection setup (§2.7), exit status rules, `$?`/`$$`/`$!`/`$#`/`$@`/
-       `$*`/positional params, traps (§2.11/2.13 `trap` builtin, minimal
-       signal handling).
-6. [ ] Special built-ins (§2.14: `:`, `.`, `break`, `continue`, `eval`,
-       `exec`, `exit`, `export`, `readonly`, `return`, `set`, `shift`,
-       `times`, `trap`, `unset`) - these must be implemented in-process
-       (not forked) and skip `PATH` search, per spec.
-7. [ ] Regular built-in utilities needed for a usable shell: `cd`, `pwd`,
-       `echo`, `printf`, `test`/`[`, `true`, `false`, `type`, `hash`,
-       `command`, `read`, `getopts`, `umask`, `wait`, `kill`, `alias`/
-       `unalias`.
+5. [x] Executor (§2.9, `src/exec/executor.cpp`) - simple command exec
+       (fork/exec/PATH search), pipelines (real `pipe(2)`s, one fork per
+       stage), `&&`/`||`/`;`/`&` lists, all compound commands (subshells
+       via real `fork(2)` - copy-on-write gives isolation for free, no
+       manual environment cloning needed), redirection setup (§2.7, all
+       operators including here-documents via `tmpfile()` to avoid a
+       pipe-buffer deadlock on large bodies), exit status rules,
+       `$?`/`$$`/`$!`/`$#`/`$@`/`$*`/positional params, functions
+       (definition + call, with `$1..`/`$#` rebound and `return`
+       unwinding via an exception - see `src/exec/control_signals.hpp`,
+       also used for `break [n]`/`continue [n]`/`exit [n]`). Command
+       substitution (the `CommandRunner` seam `Expander` was built
+       against) now actually runs things, in a forked child with stdout
+       piped back. **Not implemented**: `trap` (no real signal handling),
+       `times`, job control beyond a bare `$!`. See the "known hard
+       corners" above for two real bugs the tests caught (fork+stdio
+       buffer duplication; `lstat` vs `stat` on symlinked directories).
+6. [x] Special built-ins (§2.14, `src/exec/builtins.cpp`): `:`, `.`,
+       `break`, `continue`, `eval`, `exec`, `exit`, `export`, `readonly`,
+       `return`, `set` (positional-parameter form only - option flags
+       like `-e`/`-x` are accepted but not implemented), `shift`,
+       `unset`. **Not implemented**: `times`, `trap`.
+7. [x] Regular built-in utilities: `cd`, `pwd`, `echo`, `test`/`[`
+       (a practical subset - no `-a`/`-o`/parenthesization), `true`,
+       `false`. **Not implemented**: `printf`, `type`, `hash`, `command`,
+       `read`, `getopts`, `umask`, `wait`, `kill`, `alias`/`unalias`.
 8. [ ] Interactive mode: prompt expansion (`PS1`/`PS2`), basic line editing,
        history. Job control (`bg`/`fg`/`jobs`, `SIGTSTP` handling) - XSI,
-       may land after everything above is solid.
-9. [ ] Integration test suite (shell scripts + expected output/exit status,
-       run against the built `ush` binary).
+       may land after everything above is solid. `main.cpp` currently
+       supports `ush -c 'cmd' [name [arg...]]`, `ush script [arg...]`,
+       and whole-script-from-stdin - real non-interactive use, just not
+       an interactive REPL yet.
+9. [x] Integration test suite (`tests/integration/`) - runs the actual
+       built `ush` binary (via `fork`+`execve`, not `popen`, to avoid a
+       second layer of shell quoting) against real scripts and checks
+       combined stdout/stderr and exit status. This is what caught both
+       bugs mentioned in item 5 - process-level behavior that unit tests
+       mocking nothing couldn't have exercised.
 
-We will work through 3-9 incrementally; "broad POSIX from the start" means
-the *architecture* supports the full grammar/expansion/execution model from
-day one (no simple-commands-only shortcut baked into the design), not that
-every feature ships in the first patch.
+Items 1-9 above are all now at least minimally done; "broad POSIX from
+the start" meant the *architecture* supported the full grammar/expansion/
+execution model from day one, and it has - what's left is breadth within
+each piece (more built-ins, `trap`, interactive mode, job control) rather
+than architectural gaps.
