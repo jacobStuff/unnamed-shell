@@ -30,10 +30,13 @@ To build without tests: `cmake -S . -B build -DUSH_BUILD_TESTS=OFF`.
 
 ## Status
 
-Early scaffolding. The lexer (§2.2/§2.3 token recognition and quoting) and
-the parser (§2.10.2 grammar → AST, including here-documents) are
-implemented and unit-tested (105 + 306 assertions); the expansion pass,
-executor, and built-ins are not yet started. See the roadmap in
+Early scaffolding. Done and unit-tested (386 assertions across 74 cases):
+the lexer (§2.2/§2.3 token recognition and quoting), the parser (§2.10.2
+grammar → AST, including here-documents), the shell variable/parameter
+environment (§2.5), and arithmetic expansion (§2.6.4). Still to come: the
+rest of word expansion (tilde, parameter, command substitution, field
+splitting, pathname expansion, quote removal), the executor, and
+built-ins. See the roadmap in
 [docs/DESIGN.md](docs/DESIGN.md#status--roadmap).
 
 ## License

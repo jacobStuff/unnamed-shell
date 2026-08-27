@@ -1,8 +1,10 @@
 add_executable(ush_tests
     lexer/test_lexer.cpp
     parser/test_parser.cpp
+    runtime/test_environment.cpp
+    expand/test_arithmetic.cpp
 )
-target_link_libraries(ush_tests PRIVATE ush_parser Catch2::Catch2WithMain)
+target_link_libraries(ush_tests PRIVATE ush_parser ush_expand Catch2::Catch2WithMain)
 
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(Catch)

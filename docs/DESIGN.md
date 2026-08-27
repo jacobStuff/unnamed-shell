@@ -159,11 +159,39 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        body extraction wired through `Lexer::consumeHeredocBody` and
        `Parser::advance`. See the "known hard corners" above for the two
        documented leniencies. 49 Catch2 test cases covering the grammar.
-4. [ ] Expansion (§2.6) - tilde, parameter, command sub execution, arithmetic
-       (§2.6.4, a small recursive-descent arithmetic evaluator over `intmax_t`),
-       field splitting (§2.6.5, `IFS`), pathname expansion (§2.6.6, `glob(3)`
-       semantics reimplemented per spec, not just calling `glob(3)`), quote
-       removal (§2.6.7).
+4. [~] Expansion (§2.6):
+       - [x] `src/runtime/environment.hpp` (§2.5) - shell variable storage
+             (get/set/export/readonly/unset), positional parameters,
+             special parameters ($?/$$/$!/$0), IFS lookup, and the
+             exported-variable list execve() will need later. This is the
+             substrate every other expansion piece (and eventually the
+             executor) reads from and writes to.
+       - [x] Arithmetic expansion (§2.6.4, `src/expand/arithmetic.cpp`) - a
+             recursive-descent evaluator over `intmax_t`, covering every
+             operator POSIX lists (unary +-!~, `* / %`, binary +-, shifts,
+             relational, equality, bitwise & ^ |, && ||, `?:`, all the
+             assignment operators, comma), with assignment writing back to
+             `Environment`. One documented simplification: an unset or
+             non-numeric variable evaluates to 0 rather than being chased
+             as another variable name/expression (which e.g. bash does).
+       - [ ] Tilde expansion (§2.6.1)
+       - [ ] Parameter expansion (§2.6.2) - the `${...}` operator
+             sub-grammar (`:- := :? :+ - = ? + % %% # ##`), `${#param}`,
+             positional/special parameters, needs `Environment` +
+             recursive word-expansion for the operand.
+       - [ ] Command substitution (§2.6.3) - needs a real (if initially
+             minimal) executor to run the substituted command list and
+             capture its stdout; this is what pulls the executor into
+             scope next.
+       - [ ] Field splitting (§2.6.5, using `IFS`)
+       - [ ] Pathname expansion (§2.6.6) - current plan: use `fnmatch(3)`
+             for pattern matching and `opendir`/`readdir` for directory
+             walking (both real POSIX C-library APIs, not shell source) -
+             revised from the original "reimplement glob semantics from
+             scratch" note, since fnmatch(3) already *is* the POSIX spec
+             for this, just as libc's fork/exec/waitpid are for process
+             management.
+       - [ ] Quote removal (§2.6.7)
 5. [ ] Executor (§2.9) - simple command exec (fork/exec/PATH search),
        pipelines, `&&`/`||`/`;`/`&` lists, compound commands, subshells,
        redirection setup (§2.7), exit status rules, `$?`/`$$`/`$!`/`$#`/`$@`/
