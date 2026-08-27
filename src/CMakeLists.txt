@@ -25,14 +25,17 @@ add_library(ush_runtime STATIC
 target_include_directories(ush_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(ush_runtime PUBLIC cxx_std_20)
 
-# ush_expand: word expansion (§2.6). For now just arithmetic expansion;
-# parameter/command/tilde expansion, field splitting, and pathname
-# expansion land here next.
+# ush_expand: word expansion (§2.6) - arithmetic, tilde, parameter, and
+# command substitution (the last via an injected CommandRunner interface,
+# so this doesn't need to depend on the executor). Field splitting and
+# pathname expansion land here next.
 add_library(ush_expand STATIC
     expand/arithmetic.cpp
+    expand/pattern.cpp
+    expand/expander.cpp
 )
 target_include_directories(ush_expand PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(ush_expand PUBLIC ush_runtime)
+target_link_libraries(ush_expand PUBLIC ush_runtime ush_lexer)
 target_compile_features(ush_expand PUBLIC cxx_std_20)
 
 add_executable(ush

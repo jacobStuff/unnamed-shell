@@ -242,12 +242,20 @@ std::string Lexer::consumeHeredocBody(const std::string& delimiter, bool stripLe
 // word scanning
 // ---------------------------------------------------------------------
 
-Word Lexer::scanWord() {
+Word Lexer::scanWord() { return scanWordImpl(/*stopAtBlankOrOperator=*/true); }
+
+Word Lexer::scanWordUntilEnd() { return scanWordImpl(/*stopAtBlankOrOperator=*/false); }
+
+Word Lexer::scanWordImpl(bool stopAtBlankOrOperator) {
     Word parts;
     while (!atEnd()) {
         char c = peekChar();
-        if (c == ' ' || c == '\t' || c == '\n') break;
-        if (c == '&' || c == '|' || c == ';' || c == '<' || c == '>' || c == '(' || c == ')') break;
+        if (stopAtBlankOrOperator) {
+            if (c == ' ' || c == '\t' || c == '\n') break;
+            if (c == '&' || c == '|' || c == ';' || c == '<' || c == '>' || c == '(' || c == ')') {
+                break;
+            }
+        }
 
         if (c == '\\') {
             advanceChar();
@@ -303,49 +311,67 @@ void Lexer::scanSingleQuoted(Word& parts) {
 }
 
 void Lexer::scanDoubleQuoted(Word& parts) {
-    // Opening quote already consumed. Inside double quotes, only $ ` " \
-    // are recognized as special (§2.2.3); single quotes are NOT special.
+    // Opening quote already consumed.
     Word inner;
+    scanExpansionAwareBody(inner, /*stopAtDoubleQuote=*/true);
+    WordPart dq(WordPartKind::DoubleQuoted);
+    dq.parts = std::move(inner);
+    appendPart(parts, std::move(dq));
+}
+
+Word Lexer::scanExpansionsUntilEnd() {
+    Word parts;
+    scanExpansionAwareBody(parts, /*stopAtDoubleQuote=*/false);
+    return parts;
+}
+
+void Lexer::scanExpansionAwareBody(Word& parts, bool stopAtDoubleQuote) {
+    // Inside double quotes, only $ ` " \ are recognized as special
+    // (§2.2.3); single quotes are NOT special. Same rules apply to the
+    // other raw text this is used for (see the header comment on
+    // scanExpansionsUntilEnd()).
     while (true) {
-        if (atEnd()) errorAt("unterminated double-quoted string: missing closing '\"'", here());
+        if (atEnd()) {
+            if (stopAtDoubleQuote) {
+                errorAt("unterminated double-quoted string: missing closing '\"'", here());
+            }
+            return;
+        }
         char c = peekChar();
-        if (c == '"') {
+        if (stopAtDoubleQuote && c == '"') {
             advanceChar();
-            break;
+            return;
         }
         if (c == '\\') {
             advanceChar();
             if (atEnd()) {
-                appendChar(inner, WordPartKind::Literal, '\\');
-                continue;  // top-of-loop atEnd() check will report the error
+                appendChar(parts, WordPartKind::Literal, '\\');
+                continue;  // top-of-loop atEnd() check handles what happens next
             }
             char n = peekChar();
             if (n == '$' || n == '`' || n == '"' || n == '\\') {
-                appendChar(inner, WordPartKind::SingleQuoted, advanceChar());
+                appendChar(parts, WordPartKind::SingleQuoted, advanceChar());
             } else if (n == '\n') {
                 advanceChar();  // line continuation: both chars vanish
             } else {
                 // Backslash keeps its literal meaning; the following
                 // character is processed on its own next iteration.
-                appendChar(inner, WordPartKind::Literal, '\\');
+                appendChar(parts, WordPartKind::Literal, '\\');
             }
             continue;
         }
         if (c == '$') {
             advanceChar();
-            scanDollar(inner);
+            scanDollar(parts);
             continue;
         }
         if (c == '`') {
             advanceChar();
-            scanBacktick(inner);
+            scanBacktick(parts);
             continue;
         }
-        appendChar(inner, WordPartKind::Literal, advanceChar());
+        appendChar(parts, WordPartKind::Literal, advanceChar());
     }
-    WordPart dq(WordPartKind::DoubleQuoted);
-    dq.parts = std::move(inner);
-    appendPart(parts, std::move(dq));
 }
 
 // ---------------------------------------------------------------------

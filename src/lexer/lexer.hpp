@@ -56,6 +56,26 @@ public:
     // of input.
     std::string consumeHeredocBody(const std::string& delimiter, bool stripLeadingTabs);
 
+    // Like scanWord() (see below), but scans to the end of input instead
+    // of stopping at a blank/newline/operator-start character - i.e. as
+    // if the remaining input were already known to be exactly one word
+    // (which is the case for text captured by balanced-brace/paren
+    // scanning, e.g. a `${parameter:-word}` operand). Used by the
+    // expansion stage to re-lex such raw text with full word syntax
+    // (quotes, backslash escapes, $ / ` expansions all meaningful).
+    Word scanWordUntilEnd();
+
+    // Scans from the current position to the end of input, applying the
+    // same '$'/'`'/backslash rules as the inside of a double-quoted
+    // string (§2.2.3) - i.e. only '$', '`', '"', '\' are special via
+    // backslash, and single/double quote characters are themselves just
+    // literal text (no nested quoting is recognized). Used by the
+    // expansion stage to pre-expand raw text that undergoes "the same
+    // expansions as double-quoted text" without actually being
+    // double-quoted source: $((...)) arithmetic expressions (§2.6.4) and
+    // unquoted here-document bodies (§2.7.4).
+    Word scanExpansionsUntilEnd();
+
 private:
     std::string src_;
     std::size_t pos_ = 0;
@@ -75,10 +95,8 @@ private:
     Token lexOperator();
     Token lexWordOrIoNumber();
 
-    // Scans one shell word starting at the current position (current char
-    // is the first character of the word - a non-blank, non-newline,
-    // non-operator-start character). Stops at the first unquoted blank,
-    // newline, or operator-start character.
+    // Scans one shell word starting at the current position. Stops at the
+    // first unquoted blank, newline, or operator-start character.
     Word scanWord();
 
     // Appends one raw character to the "current" WordPart of `parts`,
@@ -98,13 +116,18 @@ private:
     // `parts`.
     void scanDoubleQuoted(Word& parts);
 
-    // Scans the inside of double quotes OR the top level of a word,
-    // handling '$' expansions and (for double-quote context) backslash
-    // rules that differ from bare-word context. `inDoubleQuotes` selects
-    // which backslash rule set applies (§2.2.2 vs §2.2.3) and whether
-    // single-quotes/further double-quotes are recognized as nested quoting
-    // (they are not, inside double quotes - only $ ` \ " are special).
-    void scanWordBody(Word& parts, bool inDoubleQuotes);
+    // Shared implementation for scanWord()/scanWordUntilEnd(): scans word
+    // content (quotes, backslash escapes, $ / ` expansions), stopping at
+    // an unquoted blank/newline/operator-start character only when
+    // `stopAtBlankOrOperator` is true.
+    Word scanWordImpl(bool stopAtBlankOrOperator);
+
+    // Shared implementation for scanDoubleQuoted()/scanExpansionsUntilEnd():
+    // scans content applying double-quote-body rules (only $ ` " \ are
+    // special), appending to `parts`, stopping at (and consuming) an
+    // unescaped '"' only when `stopAtDoubleQuote` is true - otherwise runs
+    // to end of input.
+    void scanExpansionAwareBody(Word& parts, bool stopAtDoubleQuote);
 
     // Called when we see an unescaped '$' at the current position (already
     // consumed). Appends the resulting expansion part (ParamExpansion /

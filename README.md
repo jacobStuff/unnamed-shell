@@ -30,12 +30,14 @@ To build without tests: `cmake -S . -B build -DUSH_BUILD_TESTS=OFF`.
 
 ## Status
 
-Early scaffolding. Done and unit-tested (386 assertions across 74 cases):
+Early scaffolding. Done and unit-tested (550 assertions across 99 cases):
 the lexer (§2.2/§2.3 token recognition and quoting), the parser (§2.10.2
 grammar → AST, including here-documents), the shell variable/parameter
-environment (§2.5), and arithmetic expansion (§2.6.4). Still to come: the
-rest of word expansion (tilde, parameter, command substitution, field
-splitting, pathname expansion, quote removal), the executor, and
+environment (§2.5), and word expansion minus field splitting and pathname
+expansion (§2.6: tilde, parameter expansion with the full `${...}`
+operator grammar, command substitution plumbing, arithmetic expansion,
+quote removal). Still to come: field splitting, pathname expansion, the
+executor (which command substitution needs a real implementation of), and
 built-ins. See the roadmap in
 [docs/DESIGN.md](docs/DESIGN.md#status--roadmap).
 

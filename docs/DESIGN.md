@@ -140,6 +140,29 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   follow. ush accepts a `;` and/or a linebreak in both cases, matching
   real-world shell behavior for `for i; do ... done` and
   `for i\ndo ... done`.
+- **Two more lexer re-scanning entry points**, alongside the ones used for
+  heredocs: `Lexer::scanWordUntilEnd()` (full word syntax - quotes,
+  backslash, `$`/`` ` `` - but never stops at a blank/operator, since the
+  text was already delimited by balanced braces/parens) for `${...}`
+  operands, and `Lexer::scanExpansionsUntilEnd()` (double-quote-body rules
+  - only `$`/`` ` ``/backslash-before-`$ ` " \` are special, quote
+  characters are literal) for `$((...))` pre-expansion and (not yet wired
+  up - needs the executor) unquoted here-document bodies, both of which
+  spec says undergo "the same expansions as double-quoted text".
+- **`${#}` (braced, nothing between `#` and `}`)** is treated as the
+  special parameter `#` (positional parameter count, same as bare `$#`)
+  rather than "the length of a parameter with an empty name" - the latter
+  reading is nonsensical, and this matches real shells.
+- **`$@`/`$*` used as the *operand* of a `${...}` operator** (e.g.
+  `${@:-default}`) fall back to a single joined-by-first-IFS-char string
+  (like unmodified `$*`) for the purposes of that operator, rather than
+  preserving `$@`'s per-field identity through the operator - a rare
+  combination in practice.
+- **A shell variable's value is not "chased"** when used as a bare
+  identifier in arithmetic: `x=y; y=5; echo $((x))` evaluates `x` as 0
+  (not a clean integer), not as 5. Some shells (bash) do this chasing;
+  ush's arithmetic evaluator treats an unset-or-non-numeric variable as 0
+  and stops there.
 - **Here-document delimiter quote-removal** (`Parser::flattenSimpleWord`)
   only handles delimiters built from literal text and quoting; a delimiter
   word containing a live `$`/`` ` ``/arithmetic expansion contributes no
@@ -174,16 +197,31 @@ expansion stage can detect by inspecting the first `Literal` part directly.
              `Environment`. One documented simplification: an unset or
              non-numeric variable evaluates to 0 rather than being chased
              as another variable name/expression (which e.g. bash does).
-       - [ ] Tilde expansion (§2.6.1)
-       - [ ] Parameter expansion (§2.6.2) - the `${...}` operator
-             sub-grammar (`:- := :? :+ - = ? + % %% # ##`), `${#param}`,
-             positional/special parameters, needs `Environment` +
-             recursive word-expansion for the operand.
-       - [ ] Command substitution (§2.6.3) - needs a real (if initially
-             minimal) executor to run the substituted command list and
-             capture its stdout; this is what pulls the executor into
-             scope next.
-       - [ ] Field splitting (§2.6.5, using `IFS`)
+       - [x] `src/expand/expander.cpp` - tilde (§2.6.1), parameter
+             (§2.6.2, the full `${...}` operator sub-grammar `:- := :? :+
+             - = ? + % %% # ##`, `${#param}`, positional/special
+             parameters, `$@`/`$*` including their quoted multi-field/
+             joined behavior), command substitution (§2.6.3, via an
+             injected `CommandRunner` interface so this module doesn't
+             depend on the executor - a real executor implementing it is
+             still to come), and arithmetic expansion (§2.6.4, via
+             `evaluateArithmetic`). Produces an `ExpandedWord` (a sequence
+             of quote-tagged `ExpansionPiece`s) rather than a plain
+             string - see the file's header comment - so field splitting
+             and pathname expansion (next) have the quoting information
+             they need, and so `$@` can express "hard field break here,
+             regardless of IFS" via `fieldBreakAfter`. Quote removal
+             (§2.6.7) is the trivial `flatten()` over that structure.
+             Reuses `Lexer::scanWordUntilEnd()`/`scanExpansionsUntilEnd()`
+             (added alongside this) to re-lex raw text the lexer captured
+             as opaque strings (`${...}` operands, `$((...))` bodies) -
+             see "Known hard corners" below for the two new lexer entry
+             points and what each treats as special.
+       - [ ] Field splitting (§2.6.5, using `IFS`) - consumes
+             `ExpandedWord`/`fieldBreakAfter` from the expander above.
+       - [ ] Command substitution needs a real (if initially minimal)
+             executor plugged in as a `CommandRunner` to do anything; this
+             is what pulls the executor into scope next.
        - [ ] Pathname expansion (§2.6.6) - current plan: use `fnmatch(3)`
              for pattern matching and `opendir`/`readdir` for directory
              walking (both real POSIX C-library APIs, not shell source) -
