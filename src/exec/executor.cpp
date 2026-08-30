@@ -404,6 +404,31 @@ int Executor::runSimpleCommand(const ast::SimpleCommand& cmd) {
     return status;
 }
 
+std::optional<std::string> Executor::searchPath(const std::string& name, int mode) const {
+    if (name.find('/') != std::string::npos) {
+        return ::access(name.c_str(), mode) == 0 ? std::optional(name) : std::nullopt;
+    }
+    std::string path = env_.get("PATH").value_or("/bin:/usr/bin");
+    std::size_t start = 0;
+    while (true) {
+        std::size_t colon = path.find(':', start);
+        std::string dir =
+            path.substr(start, colon == std::string::npos ? std::string::npos : colon - start);
+        if (dir.empty()) dir = ".";
+        std::string candidate = dir + "/" + name;
+        if (::access(candidate.c_str(), mode) == 0) return candidate;
+        if (colon == std::string::npos) break;
+        start = colon + 1;
+    }
+    return std::nullopt;
+}
+
+int Executor::runNameDirectly(const std::vector<std::string>& args) {
+    if (args.empty()) return 1;
+    if (isBuiltin(args[0]) && !isSpecialBuiltin(args[0])) return callBuiltin(args[0], *this, args);
+    return execExternal(args[0], args, {}, {});
+}
+
 int Executor::execExternal(const std::string& name, const std::vector<std::string>& args,
                             const std::vector<ast::Redirect>& redirects,
                             const std::vector<std::string>& envOverrides) {

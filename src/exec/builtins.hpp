@@ -4,9 +4,9 @@
 // temporary like any other command - see Executor::runSimpleCommand).
 //
 // Not yet implemented (documented gaps - see docs/DESIGN.md): `times`,
-// `trap` (no real signal handling yet), `read`, `printf`, `command`,
-// `type`, `wait`, `getopts`, `umask`, `kill`, `hash`, `alias`/`unalias`,
-// job control (`jobs`/`bg`/`fg`).
+// `trap` (no real signal handling yet), `kill`, `hash`, `alias`/
+// `unalias`, job control (`jobs`/`bg`/`fg` - `wait` exists but is
+// best-effort with no real job table).
 
 #pragma once
 

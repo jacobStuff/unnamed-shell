@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include <unistd.h>
+
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -59,6 +62,19 @@ public:
     int runList(const ast::List& list);
     void eraseFunction(const std::string& name) { functions_.erase(name); }
     bool isFunction(const std::string& name) const { return functions_.count(name) != 0; }
+
+    // Searches $PATH for a file named `name` satisfying access(2) `mode`
+    // (or, if `name` contains '/', just checks that exact path), returning
+    // the resolved path if found. Used by `command -v`/`type` (X_OK) and
+    // `.`/dot (R_OK - a sourced file need not be executable).
+    std::optional<std::string> searchPath(const std::string& name, int mode = X_OK) const;
+
+    // Runs `args[0]` as a regular builtin or external program (bypassing
+    // function lookup, but NOT special builtins - matches the `command`
+    // built-in's semantics) with `args[1..]` as its arguments and no
+    // redirects of its own (any on the `command` invocation itself were
+    // already applied by the caller). Used by the `command` built-in.
+    int runNameDirectly(const std::vector<std::string>& args);
 
 private:
     Environment& env_;

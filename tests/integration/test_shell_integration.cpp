@@ -28,18 +28,24 @@ struct RunResult {
     int status;
 };
 
-RunResult runUsh(const std::string& script, const std::vector<std::string>& extraArgs = {}) {
-    int pipefd[2];
-    REQUIRE(::pipe(pipefd) == 0);
+RunResult runUsh(const std::string& script, const std::vector<std::string>& extraArgs = {},
+                  const std::string& stdinContent = "") {
+    int outPipe[2];
+    REQUIRE(::pipe(outPipe) == 0);
+    int inPipe[2];
+    REQUIRE(::pipe(inPipe) == 0);
 
     pid_t pid = ::fork();
     REQUIRE(pid >= 0);
 
     if (pid == 0) {
-        ::dup2(pipefd[1], 1);
-        ::dup2(pipefd[1], 2);
-        ::close(pipefd[0]);
-        ::close(pipefd[1]);
+        ::dup2(inPipe[0], 0);
+        ::dup2(outPipe[1], 1);
+        ::dup2(outPipe[1], 2);
+        ::close(inPipe[0]);
+        ::close(inPipe[1]);
+        ::close(outPipe[0]);
+        ::close(outPipe[1]);
 
         std::vector<std::string> args = {USH_BINARY_PATH, "-c", script};
         for (const auto& a : extraArgs) args.push_back(a);
@@ -50,12 +56,21 @@ RunResult runUsh(const std::string& script, const std::vector<std::string>& extr
         _exit(127);
     }
 
-    ::close(pipefd[1]);
+    ::close(inPipe[0]);
+    ::close(outPipe[1]);
+
+    // Write stdin content (assumed small enough not to deadlock on the
+    // pipe buffer - true for every test here) before reading output.
+    if (!stdinContent.empty()) {
+        ::write(inPipe[1], stdinContent.data(), stdinContent.size());
+    }
+    ::close(inPipe[1]);
+
     std::string output;
     char buf[4096];
     ssize_t n;
-    while ((n = ::read(pipefd[0], buf, sizeof(buf))) > 0) output.append(buf, static_cast<std::size_t>(n));
-    ::close(pipefd[0]);
+    while ((n = ::read(outPipe[0], buf, sizeof(buf))) > 0) output.append(buf, static_cast<std::size_t>(n));
+    ::close(outPipe[0]);
 
     int wstatus = 0;
     ::waitpid(pid, &wstatus, 0);
@@ -251,4 +266,79 @@ TEST_CASE("colon is a true no-op", "[integration]") {
 TEST_CASE("eval runs a constructed command", "[integration]") {
     auto r = runUsh("cmd='echo hi there'; eval $cmd");
     CHECK(r.output == "hi there\n");
+}
+
+TEST_CASE("printf: basic conversions, width/precision, and cycling", "[integration]") {
+    CHECK(runUsh("printf '%s is %d\\n' Alice 30").output == "Alice is 30\n");
+    CHECK(runUsh("printf '%-6s|%5d|\\n' hi 42").output == "hi    |   42|\n");
+    CHECK(runUsh("printf '%x %o\\n' 255 8").output == "ff 10\n");
+    // More arguments than conversions -> the format is reused.
+    CHECK(runUsh("printf '%d-%d\\n' 1 2 3 4 5").output == "1-2\n3-4\n5-0\n");
+    // A literal '%%' and backslash escapes in the format text itself.
+    CHECK(runUsh("printf '100%%\\tdone\\n'").output == "100%\tdone\n");
+}
+
+TEST_CASE("read splits a line on IFS, with the last variable absorbing extra fields",
+          "[integration]") {
+    auto r = runUsh("read a b rest; echo \"[$a][$b][$rest]\"", {}, "hello world  extra1 extra2\n");
+    CHECK(r.output == "[hello][world][extra1 extra2]\n");
+}
+
+TEST_CASE("read without -r processes a trailing backslash-newline as a line continuation",
+          "[integration]") {
+    auto r = runUsh("read line; echo \"[$line]\"", {}, "one\\\ntwo\n");
+    CHECK(r.output == "[onetwo]\n");
+}
+
+TEST_CASE("read -r treats backslash literally", "[integration]") {
+    auto r = runUsh("read -r line; echo \"[$line]\"", {}, "a\\nb\n");
+    CHECK(r.output == "[a\\nb]\n");
+}
+
+TEST_CASE("read reports failure at end of input", "[integration]") {
+    auto r = runUsh("read x; echo \"status=$?\"", {}, "");
+    CHECK(r.output == "status=1\n");
+}
+
+TEST_CASE("command -v and command bypassing a function", "[integration]") {
+    CHECK(runUsh("command -v echo").output == "echo\n");
+    CHECK(runUsh("command -v this_command_definitely_does_not_exist_xyz").status == 1);
+    // `command` skips function lookup, so a function named after a
+    // builtin doesn't shadow it.
+    auto r = runUsh("echo() { printf 'shadowed\\n'; }; command echo real");
+    CHECK(r.output == "real\n");
+}
+
+TEST_CASE("type identifies builtins, functions, and external commands", "[integration]") {
+    CHECK(runUsh("type cd").output == "cd is a shell builtin\n");
+    CHECK(runUsh("f() { :; }; type f").output == "f is a function\n");
+    CHECK(runUsh("type :").output == ": is a special shell builtin\n");
+    CHECK(runUsh("type this_command_definitely_does_not_exist_xyz").status == 1);
+}
+
+TEST_CASE("getopts parses bundled short options and an option with an argument",
+          "[integration]") {
+    auto r = runUsh(
+        "while getopts \"ab:\" opt; do case $opt in "
+        "a) echo flag-a ;; b) echo \"arg=$OPTARG\" ;; esac; done; "
+        "shift $((OPTIND - 1)); echo \"rest=$*\"",
+        {"argv0", "-ab", "val", "extra"});
+    CHECK(r.output == "flag-a\narg=val\nrest=extra\n");
+}
+
+TEST_CASE("getopts reports an unknown option via '?'", "[integration]") {
+    auto r = runUsh(
+        "getopts \"a\" opt 2>/dev/null; echo \"opt=$opt\"",
+        {"argv0", "-z"});
+    CHECK(r.output == "opt=?\n");
+}
+
+TEST_CASE("umask reports and sets the current mask", "[integration]") {
+    auto r = runUsh("umask 022; umask");
+    CHECK(r.output == "0022\n");
+}
+
+TEST_CASE("wait reaps a background job and returns its exit status", "[integration]") {
+    auto r = runUsh("(exit 7) & wait; echo \"status=$?\"");
+    CHECK(r.output == "status=7\n");
 }

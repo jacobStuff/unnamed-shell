@@ -311,8 +311,20 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        `unset`. **Not implemented**: `times`, `trap`.
 7. [x] Regular built-in utilities: `cd`, `pwd`, `echo`, `test`/`[`
        (a practical subset - no `-a`/`-o`/parenthesization), `true`,
-       `false`. **Not implemented**: `printf`, `type`, `hash`, `command`,
-       `read`, `getopts`, `umask`, `wait`, `kill`, `alias`/`unalias`.
+       `false`, `printf` (`%s %d %i %u %o %x %X %c %b %%` with real
+       flags/width/precision delegated to libc `snprintf` per
+       conversion, not reimplemented - no `%e`/`%f`/`%g` floating
+       point), `read` (`-r`, IFS field splitting with the last variable
+       absorbing extras - joined with a plain space rather than
+       preserving original separators, a documented simplification),
+       `command` (`-v`, and bypassing function lookup), `type`,
+       `getopts` (bundled short options, `OPTARG`/`OPTIND`, silent mode
+       via a leading `:` - the "which character within the current arg"
+       position POSIX leaves as shell-internal state lives in an
+       internal env var, `_ush_getopts_charidx`), `wait` (best-effort:
+       reaps *all* children with no argument, since there's no job
+       table yet - see item 8), `umask`. **Not implemented**: `hash`,
+       `kill`, `alias`/`unalias`.
 8. [ ] Interactive mode: prompt expansion (`PS1`/`PS2`), basic line editing,
        history. Job control (`bg`/`fg`/`jobs`, `SIGTSTP` handling) - XSI,
        may land after everything above is solid. `main.cpp` currently

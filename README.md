@@ -34,21 +34,23 @@ echo 'echo hi' | ./build/src/ush              # run a script from stdin
 
 ## Status
 
-The core pipeline is now end to end and can actually run scripts: the
-lexer (§2.2/§2.3), the parser (§2.10.2 grammar → AST, including
-here-documents), the shell variable/parameter environment (§2.5), all of
-word expansion (§2.6 - tilde, the full `${...}` parameter expansion
-grammar, command substitution, arithmetic expansion, field splitting,
-pathname expansion, quote removal), and the executor (§2.9/§2.7 -
-fork/exec/pipelines/redirection/all compound commands/functions, plus
-POSIX's special built-ins and a practical subset of the regular ones:
-`cd`, `pwd`, `echo`, `test`/`[`, `true`, `false`). Done and tested: 702
-assertions across 150 cases, including integration tests that run the
+The core pipeline is end to end and can run real scripts: the lexer
+(§2.2/§2.3), the parser (§2.10.2 grammar → AST, including here-documents),
+the shell variable/parameter environment (§2.5), all of word expansion
+(§2.6 - tilde, the full `${...}` parameter expansion grammar, command
+substitution, arithmetic expansion, field splitting, pathname expansion,
+quote removal), and the executor (§2.9/§2.7 -
+fork/exec/pipelines/redirection/all compound commands/functions). Built-
+ins: every POSIX special built-in except `trap`/`times`, plus a practical
+regular set - `cd`, `pwd`, `echo`, `printf`, `read`, `test`/`[`, `true`,
+`false`, `command`, `type`, `getopts`, `wait`, `umask`. Done and tested:
+823 assertions across 161 cases, including integration tests that run the
 actual built binary end to end.
 
-Still to come: more built-ins (`printf`, `read`, `type`, `command`,
-`getopts`, ...), `trap`/real signal handling, and interactive mode (a
-prompt, line editing, job control). See the roadmap in
+Still to come: `trap`/real signal handling, job control (`jobs`/`bg`/`fg`
+- `wait` exists but is best-effort with no job table yet), a few more
+niche built-ins (`kill`, `hash`, `alias`), and interactive mode (a
+prompt, line editing, history). See the roadmap in
 [docs/DESIGN.md](docs/DESIGN.md#status--roadmap).
 
 ## License
