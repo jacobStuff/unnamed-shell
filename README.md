@@ -46,19 +46,22 @@ including here-documents), the shell variable/parameter environment
 (§2.5), all of word expansion (§2.6 - tilde, the full `${...}` parameter
 expansion grammar, command substitution, arithmetic expansion, field
 splitting, pathname expansion, quote removal), the executor (§2.9/§2.7 -
-fork/exec/pipelines/redirection/all compound commands/functions), and a
-real interactive REPL (prompts, multi-line continuation, `Ctrl-C` no
-longer killing the shell). Built-ins: every POSIX special built-in except
-`trap`/`times`, plus a practical regular set - `cd`, `pwd`, `echo`,
-`printf`, `read`, `test`/`[`, `true`, `false`, `command`, `type`,
-`getopts`, `wait`, `umask`. Done and tested: 869 assertions across 171
-cases, including integration tests that run the actual built binary end
-to end (interactively too, via `-i`).
+fork/exec/pipelines/redirection/all compound commands/functions), a real
+interactive REPL (prompts, multi-line continuation, `Ctrl-C` no longer
+killing the shell), and real trap/signal handling (`trap`, an `EXIT`
+handler that runs exactly once, and signals that interrupt a running
+foreground command promptly rather than waiting for it to finish first).
+Built-ins: every POSIX special built-in, plus a practical regular set -
+`cd`, `pwd`, `echo`, `printf`, `read`, `test`/`[`, `true`, `false`,
+`command`, `type`, `getopts`, `wait`, `umask`, `kill`. Done and tested:
+905 assertions across 179 cases, including integration tests that run
+the actual built binary end to end (interactively too, via `-i`, and
+including sending a real signal to a running child process).
 
-Still to come: `trap`/real signal handling, job control (`jobs`/`bg`/`fg`
-- `wait` exists but is best-effort with no job table yet), a few more
-niche built-ins (`kill`, `hash`, `alias`), and real line editing/history
-(arrow-key recall, cursor movement). See the roadmap in
+Still to come: job control (`jobs`/`bg`/`fg` - `wait` exists but is
+best-effort with no job table yet), a couple of niche built-ins (`hash`,
+`alias`), and real line editing/history (arrow-key recall, cursor
+movement). See the roadmap in
 [docs/DESIGN.md](docs/DESIGN.md#status--roadmap).
 
 ## License

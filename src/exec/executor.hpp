@@ -87,6 +87,41 @@ public:
     // already applied by the caller). Used by the `command` built-in.
     int runNameDirectly(const std::vector<std::string>& args);
 
+    // --- trap (§2.14 trap, §2.11) ---------------------------------------
+    //
+    // Signal number 0 is used for EXIT throughout this interface,
+    // matching `trap`'s own convention. Setting a trap for a real signal
+    // installs an OS handler that only records the signal as pending
+    // (async-signal-safe); the action itself runs later, at a safe point
+    // - see servicePendingTraps() - not from within the handler.
+
+    // Sets `action` to run when `signum` occurs. An empty `action` means
+    // "ignore this condition" (SIG_IGN for a real signal).
+    void setTrap(int signum, std::string action);
+    // Resets `signum` to its default disposition and forgets any trap.
+    void unsetTrap(int signum);
+    // The currently-registered action for `signum`, or nullopt if it has
+    // no trap set (default disposition). Used by `trap` with no operands
+    // (list current traps).
+    std::optional<std::string> trapAction(int signum) const;
+    std::vector<int> trappedSignals() const;
+
+    // Runs the action for any signal that arrived since the last call
+    // (each exactly once), in an unspecified order. Called between list
+    // items (so a trap fires promptly even in a tight builtin-only loop)
+    // and while blocked waiting for a foreground child (see
+    // waitForChild()) - never from inside the OS signal handler itself.
+    void servicePendingTraps();
+
+    // Runs the EXIT trap, if one is set, with `$?` visible to it as
+    // `currentStatus` - then returns the shell's actual final exit
+    // status: `currentStatus` unchanged, unless the trap action itself
+    // calls `exit`, which overrides it. Called exactly once, by main.cpp,
+    // right before the process actually terminates (not by
+    // runProgram()/runProgramCatchingExit(), since interactive mode runs
+    // those once per input line, not once per session).
+    int runExitTrapIfSet(int currentStatus);
+
 private:
     Environment& env_;
     Expander expander_;
@@ -94,6 +129,17 @@ private:
     // Function bodies, by name. Raw pointers into whatever ast::List is
     // currently being run - see the file header comment on lifetime.
     std::unordered_map<std::string, const ast::FunctionDefinition*> functions_;
+
+    // Trap actions by condition (0 == EXIT). An empty string means
+    // "ignore"; absence means "default disposition, not trapped".
+    std::unordered_map<int, std::string> trapActions_;
+
+    // waitpid(2) for `pid`, but servicing pending traps (see
+    // servicePendingTraps()) and resuming the wait each time one is
+    // interrupted by a signal, instead of either busy-looping past it
+    // (as a blind EINTR-retry would) or giving up. Returns once `pid`
+    // has actually changed state.
+    pid_t waitForChild(pid_t pid, int* status);
 
     int runAndOr(const ast::AndOr& andOr);
     int runPipeline(const ast::Pipeline& pipeline);

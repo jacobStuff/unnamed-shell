@@ -248,6 +248,26 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   this reliably would mean asserting on real process-group signal
   delivery and timing, which is a more likely source of flaky CI than of
   genuine regression coverage, so it's deliberately not in the suite.
+- **`signal(2)` vs `sigaction(2)`/`SA_RESTART` for trap handlers** - a
+  real bug caught by hand (before it had automated coverage; it does
+  now). Installing a trap's signal handler with the legacy `signal(2)`
+  wrapper worked in the sense that the handler ran and the trap action
+  eventually executed, but on macOS (and potentially other libcs)
+  `signal(2)` implies `SA_RESTART`, which makes the kernel silently
+  resume an interrupted blocking syscall instead of returning `EINTR` to
+  it. `Executor::waitForChild()` depends entirely on seeing that `EINTR`
+  to know it should call `servicePendingTraps()` - without it, a
+  `sleep 30` in the foreground would fully absorb the interrupt and the
+  trap would only run once that 30 seconds elapsed on its own, which
+  defeats the actual point of trapping a signal for prompt shutdown.
+  Confusingly, the trap still visibly "worked" in ad hoc testing (its
+  `echo` output showed up in the end) because fully-buffered stdio (a
+  non-tty stdout) made *when* it ran indistinguishable from *whether* it
+  ran without directly timing the process's actual death - a reminder
+  that "the expected output eventually appears" is a much weaker check
+  than "it appears when it's supposed to". Fixed by installing trap
+  handlers via `sigaction(2)` with `sa_flags = 0` (no `SA_RESTART`)
+  instead - see `installSignalDisposition()` in `executor.cpp`.
 
 ## Status / roadmap
 
@@ -337,15 +357,30 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        also used for `break [n]`/`continue [n]`/`exit [n]`). Command
        substitution (the `CommandRunner` seam `Expander` was built
        against) now actually runs things, in a forked child with stdout
-       piped back. **Not implemented**: `trap` (no real signal handling),
-       `times`, job control beyond a bare `$!`. See the "known hard
-       corners" above for two real bugs the tests caught (fork+stdio
-       buffer duplication; `lstat` vs `stat` on symlinked directories).
+       piped back. Real signal/trap handling (§2.11): trapped signals
+       install a `sigaction(2)` handler (deliberately without
+       `SA_RESTART` - see the hard-corners note) that only records the
+       signal as pending; `Executor::servicePendingTraps()` runs the
+       actual trap action later, at a safe point - between list items
+       (so a trap fires promptly even in a tight builtin-only loop) and
+       whenever a blocked wait for a foreground child is interrupted
+       (so it fires promptly there too, without waiting for that child
+       to finish on its own). The `EXIT` trap runs exactly once, at the
+       two real termination points (`main.cpp`, both the non-interactive
+       path and the end of the interactive session) - not inside
+       `runProgram()`, which interactive mode calls once per input line.
+       **Not implemented**: job control beyond a bare `$!` (`SIGTSTP`,
+       process groups, `bg`/`fg`/`jobs`). See the "known hard corners"
+       above for three real bugs the tests caught (fork+stdio buffer
+       duplication; `lstat` vs `stat` on symlinked directories; `signal`
+       vs `sigaction`/`SA_RESTART` silently defeating prompt trap
+       delivery).
 6. [x] Special built-ins (§2.14, `src/exec/builtins.cpp`): `:`, `.`,
        `break`, `continue`, `eval`, `exec`, `exit`, `export`, `readonly`,
        `return`, `set` (positional-parameter form only - option flags
        like `-e`/`-x` are accepted but not implemented), `shift`,
-       `unset`. **Not implemented**: `times`, `trap`.
+       `trap` (condition list, `-p`, the single-numeric-operand
+       backward-compatible reset form), `times`, `unset`.
 7. [x] Regular built-in utilities: `cd`, `pwd`, `echo`, `test`/`[`
        (a practical subset - no `-a`/`-o`/parenthesization), `true`,
        `false`, `printf` (`%s %d %i %u %o %x %X %c %b %%` with real
@@ -360,8 +395,10 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        position POSIX leaves as shell-internal state lives in an
        internal env var, `_ush_getopts_charidx`), `wait` (best-effort:
        reaps *all* children with no argument, since there's no job
-       table yet - see item 8), `umask`. **Not implemented**: `hash`,
-       `kill`, `alias`/`unalias`.
+       table yet - see item 8), `umask`, `kill` (`-signal`/`-l`, sharing
+       the same name/number table as `trap` - no `%job` operand, since
+       there's no job table). **Not implemented**: `hash`, `alias`/
+       `unalias`.
 8. [~] Interactive mode (`src/main.cpp`'s `runInteractive`): a real REPL -
        prompts with `PS1`/`PS2` (expanded the same as any other word:
        tilde/parameter/command/arithmetic + quote removal), reads and
@@ -394,16 +431,21 @@ expansion stage can detect by inspecting the first `Literal` part directly.
 9. [x] Integration test suite (`tests/integration/`) - runs the actual
        built `ush` binary (via `fork`+`execve`, not `popen`, to avoid a
        second layer of shell quoting) against real scripts and checks
-       combined stdout/stderr and exit status. This is what caught both
-       bugs mentioned in item 5 - process-level behavior that unit tests
-       mocking nothing couldn't have exercised. Also covers interactive
-       mode end to end (via `-i`, see item 8): PS1/PS2 prompts appearing
-       exactly where expected, multi-line continuation, function
-       persistence across lines, `exit` ending the session immediately,
-       and syntax-error recovery.
+       combined stdout/stderr and exit status. This is what caught the
+       three bugs mentioned in item 5 - process-level behavior that unit
+       tests mocking nothing couldn't have exercised. Also covers
+       interactive mode end to end (via `-i`, see item 8): PS1/PS2
+       prompts appearing exactly where expected, multi-line continuation,
+       function persistence across lines, `exit` ending the session
+       immediately, and syntax-error recovery; and trap/signal handling,
+       including one test that sends a real `SIGTERM` to a running `ush`
+       child process and requires it to react within ~5s despite being
+       in the middle of a 30s `sleep` - a deliberately generous but still
+       meaningful deadline, guarding against the `SA_RESTART` regression
+       coming back without being sensitive to CI timing noise.
 
 Items 1-9 above are all now at least minimally done; "broad POSIX from
 the start" meant the *architecture* supported the full grammar/expansion/
 execution model from day one, and it has - what's left is breadth within
-each piece (more built-ins, `trap`, interactive mode, job control) rather
-than architectural gaps.
+each piece (more built-ins, interactive line editing/history, job
+control) rather than architectural gaps.

@@ -85,7 +85,12 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
 
     std::string buffer;
     bool continuing = false;
+    int status = 0;
 
+    // Every return path below falls through to here instead of returning
+    // directly, so the EXIT trap (if any) always gets to run exactly once,
+    // right before the session actually ends - see
+    // Executor::runExitTrapIfSet().
     while (true) {
         std::string prompt =
             continuing ? expandPrompt(executor, env, "PS2", "> ")
@@ -98,7 +103,9 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
             std::fputc('\n', stdout);
             if (!buffer.empty()) {
                 std::cerr << "ush: syntax error: unexpected end of file\n";
-                return 2;
+                status = 2;
+            } else {
+                status = env.lastExitStatus;
             }
             break;
         }
@@ -134,9 +141,12 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
 
         programs.push_back(std::move(program));
         auto outcome = executor.runProgramCatchingExit(programs.back());
-        if (outcome.exitRequested) return outcome.status;
+        if (outcome.exitRequested) {
+            status = outcome.status;
+            break;
+        }
     }
-    return env.lastExitStatus;
+    return executor.runExitTrapIfSet(status);
 }
 
 }  // namespace
@@ -197,5 +207,6 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    return executor.runProgram(program);
+    int status = executor.runProgram(program);
+    return executor.runExitTrapIfSet(status);
 }

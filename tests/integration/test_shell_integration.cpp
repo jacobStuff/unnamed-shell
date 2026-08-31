@@ -6,9 +6,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -422,4 +424,95 @@ TEST_CASE("-i combined with -c just runs non-interactively (documented simplific
           "[integration]") {
     auto r = runUshWithArgv({USH_BINARY_PATH, "-i", "-c", "echo hi"}, "");
     CHECK(r.output == "hi\n");
+}
+
+// --- trap / times / kill -------------------------------------------------
+
+TEST_CASE("an EXIT trap runs once, after the script's own last command",
+          "[integration]") {
+    auto r = runUsh("trap 'echo cleanup' EXIT; echo body");
+    CHECK(r.output == "body\ncleanup\n");
+}
+
+TEST_CASE("an EXIT trap runs (and the original status is preserved) when exit is called",
+          "[integration]") {
+    auto r = runUsh("trap 'echo cleanup' EXIT; echo body; exit 3");
+    CHECK(r.output == "body\ncleanup\n");
+    CHECK(r.status == 3);
+}
+
+TEST_CASE("an EXIT trap calling exit itself overrides the final status", "[integration]") {
+    auto r = runUsh("trap 'exit 9' EXIT; exit 3");
+    CHECK(r.status == 9);
+}
+
+TEST_CASE("trap with no operands lists currently-trapped conditions", "[integration]") {
+    auto r = runUsh("trap 'echo hi' TERM; trap");
+    CHECK(r.output == "trap -- 'echo hi' TERM\n");
+}
+
+TEST_CASE("trap - resets a condition to its default and removes it from the listing",
+          "[integration]") {
+    auto r = runUsh("trap 'echo hi' TERM; trap - TERM; trap");
+    CHECK(r.output == "");
+}
+
+TEST_CASE("times runs successfully and reports two lines of CPU time", "[integration]") {
+    auto r = runUsh("times");
+    CHECK(r.status == 0);
+    CHECK(std::count(r.output.begin(), r.output.end(), '\n') == 2);
+    CHECK(r.output.find('m') != std::string::npos);
+    CHECK(r.output.find('s') != std::string::npos);
+}
+
+TEST_CASE("kill sends a signal that terminates the target process", "[integration]") {
+    auto r = runUsh("sleep 30 & pid=$!; kill $pid; wait $pid; echo \"status=$?\"");
+    CHECK(r.output == "status=143\n");  // 128 + SIGTERM(15)
+}
+
+TEST_CASE("a signal trap interrupts a blocked wait on a foreground child promptly",
+          "[integration]") {
+    // Regression test: signal(2) on at least macOS installs handlers with
+    // SA_RESTART implied, which would make a blocked waitpid(2)
+    // transparently resume instead of returning EINTR - the trap would
+    // still eventually run, but only once the foreground child happened
+    // to exit on its own (here, after the full 30-second sleep), which
+    // defeats the entire point of trapping a signal for prompt shutdown.
+    // Fixed via sigaction(2) with SA_RESTART deliberately not set - see
+    // docs/DESIGN.md. The huge margin between the sleep (30s) and this
+    // test's deadline (~5s) is deliberate: it needs to be generous enough
+    // to never flake under CI load while still failing hard if the old,
+    // "wait for the child no matter what" behavior ever comes back.
+    pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        std::vector<std::string> args = {USH_BINARY_PATH, "-c",
+                                          "trap 'exit 7' TERM; sleep 30; exit 1"};
+        std::vector<char*> argv;
+        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        ::execv(USH_BINARY_PATH, argv.data());
+        _exit(127);
+    }
+
+    ::usleep(300000);  // give the trap time to install before signaling
+    ::kill(pid, SIGTERM);
+
+    int wstatus = 0;
+    bool exited = false;
+    for (int i = 0; i < 50; ++i) {  // up to ~5s total, far under the 30s sleep
+        pid_t r = ::waitpid(pid, &wstatus, WNOHANG);
+        if (r == pid) {
+            exited = true;
+            break;
+        }
+        ::usleep(100000);
+    }
+    if (!exited) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &wstatus, 0);
+    }
+    REQUIRE(exited);
+    CHECK(WIFEXITED(wstatus));
+    CHECK(WEXITSTATUS(wstatus) == 7);
 }

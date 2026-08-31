@@ -1,12 +1,15 @@
 #include "exec/builtins.hpp"
 
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/times.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +41,48 @@ int parseIntArg(const std::string& s, int fallback) {
     }
 }
 
+// Shared by `trap` and `kill`. Covers the signals standardized by POSIX
+// and available under the same name on both macOS and Linux.
+struct SignalSpec {
+    int number;
+    const char* name;
+};
+const SignalSpec kSignalTable[] = {
+    {SIGHUP, "HUP"},     {SIGINT, "INT"},       {SIGQUIT, "QUIT"},   {SIGILL, "ILL"},
+    {SIGTRAP, "TRAP"},   {SIGABRT, "ABRT"},     {SIGFPE, "FPE"},     {SIGKILL, "KILL"},
+    {SIGBUS, "BUS"},     {SIGSEGV, "SEGV"},     {SIGSYS, "SYS"},     {SIGPIPE, "PIPE"},
+    {SIGALRM, "ALRM"},   {SIGTERM, "TERM"},     {SIGUSR1, "USR1"},   {SIGUSR2, "USR2"},
+    {SIGCHLD, "CHLD"},   {SIGCONT, "CONT"},     {SIGSTOP, "STOP"},   {SIGTSTP, "TSTP"},
+    {SIGTTIN, "TTIN"},   {SIGTTOU, "TTOU"},     {SIGURG, "URG"},     {SIGXCPU, "XCPU"},
+    {SIGXFSZ, "XFSZ"},   {SIGVTALRM, "VTALRM"}, {SIGPROF, "PROF"},   {SIGWINCH, "WINCH"},
+};
+
+// Parses a `trap`/`kill` condition: "EXIT" or "0" (trap only - kill has
+// no EXIT pseudo-signal, but harmlessly accepting it there doesn't hurt),
+// a bare number, or a signal name with or without the "SIG" prefix.
+std::optional<int> parseSignalCondition(const std::string& s) {
+    if (s == "EXIT" || s == "0") return 0;
+    std::string name = s.rfind("SIG", 0) == 0 ? s.substr(3) : s;
+    for (const auto& spec : kSignalTable) {
+        if (name == spec.name) return spec.number;
+    }
+    try {
+        std::size_t consumed = 0;
+        int n = std::stoi(s, &consumed);
+        if (consumed == s.size()) return n;
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+std::string signalConditionName(int signum) {
+    if (signum == 0) return "EXIT";
+    for (const auto& spec : kSignalTable) {
+        if (spec.number == signum) return spec.name;
+    }
+    return std::to_string(signum);
+}
+
 // --- special builtins -------------------------------------------------
 
 int biColon(Executor&, const std::vector<std::string>&) { return 0; }
@@ -45,6 +90,7 @@ int biColon(Executor&, const std::vector<std::string>&) { return 0; }
 int biExit(Executor& ex, const std::vector<std::string>& args) {
     int status = ex.env().lastExitStatus;
     if (args.size() >= 2) status = parseIntArg(args[1], 2);
+    ex.env().lastExitStatus = status;  // so $? in an EXIT trap sees this, not the prior command's
     throw ExitSignal{status};
 }
 
@@ -216,6 +262,93 @@ int biExec(Executor& ex, const std::vector<std::string>& args) {
     // §2.14 exec: failing to execute causes a non-interactive shell to
     // exit (127 if not found, 126 if found but not executable).
     throw ExitSignal{foundExecutable ? 126 : 127};
+}
+
+// `trap [action condition...]`: with no operands, lists every currently-
+// trapped condition. `action` of "-" resets to the default disposition;
+// an empty string means "ignore". As a backward-compatible shorthand
+// (§2.14), a single all-digit operand alone means "reset that condition
+// to default", equivalent to `trap - N`.
+int biTrap(Executor& ex, const std::vector<std::string>& args) {
+    if (args.size() == 1) {
+        for (int signum : ex.trappedSignals()) {
+            auto action = ex.trapAction(signum);
+            std::printf("trap -- '%s' %s\n", action->c_str(), signalConditionName(signum).c_str());
+        }
+        return 0;
+    }
+
+    std::size_t i = 1;
+    if (args[i] == "-p") {
+        std::vector<int> signums;
+        if (i + 1 < args.size()) {
+            for (std::size_t k = i + 1; k < args.size(); ++k) {
+                auto sig = parseSignalCondition(args[k]);
+                if (sig) signums.push_back(*sig);
+            }
+        } else {
+            signums = ex.trappedSignals();
+        }
+        for (int signum : signums) {
+            auto action = ex.trapAction(signum);
+            if (action) {
+                std::printf("trap -- '%s' %s\n", action->c_str(), signalConditionName(signum).c_str());
+            }
+        }
+        return 0;
+    }
+
+    if (args.size() == 2) {
+        bool allDigits = !args[1].empty();
+        for (char c : args[1]) {
+            if (!std::isdigit(static_cast<unsigned char>(c))) allDigits = false;
+        }
+        if (allDigits) {
+            if (auto sig = parseSignalCondition(args[1])) {
+                ex.unsetTrap(*sig);
+                return 0;
+            }
+        }
+    }
+
+    const std::string& action = args[i];
+    ++i;
+    if (i >= args.size()) {
+        std::fprintf(stderr, "ush: trap: usage: trap [action] condition...\n");
+        return 2;
+    }
+    for (; i < args.size(); ++i) {
+        auto sig = parseSignalCondition(args[i]);
+        if (!sig) {
+            std::fprintf(stderr, "ush: trap: %s: invalid condition\n", args[i].c_str());
+            return 1;
+        }
+        if (action == "-") {
+            ex.unsetTrap(*sig);
+        } else {
+            ex.setTrap(*sig, action);
+        }
+    }
+    return 0;
+}
+
+int biTimes(Executor&, const std::vector<std::string>&) {
+    struct tms t;
+    if (::times(&t) == static_cast<clock_t>(-1)) {
+        std::perror("ush: times");
+        return 1;
+    }
+    long hz = ::sysconf(_SC_CLK_TCK);
+    if (hz <= 0) hz = 100;
+    auto printLine = [&](clock_t userTicks, clock_t sysTicks) {
+        double u = static_cast<double>(userTicks) / hz;
+        double s = static_cast<double>(sysTicks) / hz;
+        std::printf("%ldm%.3fs %ldm%.3fs\n", static_cast<long>(u / 60), std::fmod(u, 60.0),
+                    static_cast<long>(s / 60), std::fmod(s, 60.0));
+    };
+    printLine(t.tms_utime, t.tms_stime);    // this shell process
+    printLine(t.tms_cutime, t.tms_cstime);  // its children
+    return 0;
 }
 
 // --- regular builtins ---------------------------------------------------
@@ -764,12 +897,59 @@ int biUmask(Executor&, const std::vector<std::string>& args) {
     }
 }
 
+// `kill [-signal] pid...` / `kill -l`: sends a signal (default TERM) to
+// each pid, or lists known signal names. No job-control `%job` operand
+// support (ush has no job table yet - see docs/DESIGN.md).
+int biKill(Executor&, const std::vector<std::string>& args) {
+    std::size_t i = 1;
+    if (i < args.size() && args[i] == "-l") {
+        for (const auto& spec : kSignalTable) std::printf("%s ", spec.name);
+        std::printf("\n");
+        return 0;
+    }
+
+    int signum = SIGTERM;
+    if (i < args.size() && args[i].size() > 1 && args[i][0] == '-') {
+        auto sig = parseSignalCondition(args[i].substr(1));
+        if (!sig || *sig == 0) {
+            std::fprintf(stderr, "ush: kill: %s: invalid signal\n", args[i].c_str());
+            return 1;
+        }
+        signum = *sig;
+        ++i;
+    }
+    if (i >= args.size()) {
+        std::fprintf(stderr, "ush: kill: usage: kill [-signal] pid...\n");
+        return 2;
+    }
+
+    int status = 0;
+    for (; i < args.size(); ++i) {
+        std::size_t consumed = 0;
+        long pidVal = 0;
+        try {
+            pidVal = std::stol(args[i], &consumed);
+        } catch (...) {
+        }
+        if (consumed != args[i].size()) {
+            std::fprintf(stderr, "ush: kill: %s: arguments must be process IDs\n", args[i].c_str());
+            status = 1;
+            continue;
+        }
+        if (::kill(static_cast<pid_t>(pidVal), signum) != 0) {
+            std::fprintf(stderr, "ush: kill: (%s): %s\n", args[i].c_str(), std::strerror(errno));
+            status = 1;
+        }
+    }
+    return status;
+}
+
 // --- registry -----------------------------------------------------------
 
 const std::unordered_set<std::string>& specialBuiltinNames() {
     static const std::unordered_set<std::string> names = {
         ":", ".", "break", "continue", "eval", "exec", "exit",
-        "export", "readonly", "return", "set", "shift", "unset",
+        "export", "readonly", "return", "set", "shift", "trap", "times", "unset",
     };
     return names;
 }
@@ -782,7 +962,7 @@ const std::unordered_map<std::string, BuiltinFunc>& builtinTable() {
         {"continue", biContinue}, {"eval", biEval},     {"exec", biExec},
         {"exit", biExit},       {"export", biExport},   {"readonly", biReadonly},
         {"return", biReturn},   {"set", biSet},         {"shift", biShift},
-        {"unset", biUnset},
+        {"trap", biTrap},       {"times", biTimes},     {"unset", biUnset},
 
         {"cd", biCd},           {"pwd", biPwd},         {"echo", biEcho},
         {"true", biTrueBuiltin}, {"false", biFalseBuiltin},
@@ -790,7 +970,7 @@ const std::unordered_map<std::string, BuiltinFunc>& builtinTable() {
 
         {"printf", biPrintf},   {"read", biRead},       {"command", biCommand},
         {"type", biType},       {"getopts", biGetopts}, {"wait", biWait},
-        {"umask", biUmask},
+        {"umask", biUmask},     {"kill", biKill},
     };
     return table;
 }

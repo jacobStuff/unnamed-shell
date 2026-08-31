@@ -38,17 +38,37 @@ int statusFromWait(int wstatus) {
 
 [[noreturn]] void exitChild(int status) { std::exit(status & 0xFF); }
 
-// waitpid(2), retrying on EINTR. Needed once the shell can have a signal
-// handler installed at all (interactive mode ignores SIGINT/SIGQUIT so
-// Ctrl-C/Ctrl-\ at the prompt don't kill the shell - see main.cpp) -
-// without retrying, a blocked wait interrupted by a delivered-but-ignored
-// signal would return early with `wstatus` never actually filled in by
-// the child's real exit, misreporting its status.
-pid_t waitpidRetry(pid_t pid, int* status, int options) {
-    pid_t r;
-    while ((r = ::waitpid(pid, status, options)) < 0 && errno == EINTR) {
-    }
-    return r;
+// Set by trapSignalHandler() (async-signal-safe: it only touches a
+// sig_atomic_t array), read and cleared by Executor::servicePendingTraps()
+// at a safe point - never run the trap action from the handler itself.
+// Sized generously rather than relying on platform NSIG (which differs
+// between macOS and Linux); every signal number this shell deals with
+// fits well within it.
+constexpr int kMaxTrapSignal = 64;
+volatile sig_atomic_t g_pendingSignal[kMaxTrapSignal] = {};
+
+void trapSignalHandler(int signum) {
+    if (signum >= 0 && signum < kMaxTrapSignal) g_pendingSignal[signum] = 1;
+}
+
+// Installs `handler` (a real handler, SIG_IGN, or SIG_DFL) for `signum`
+// via sigaction(2) rather than signal(2), and - critically - WITHOUT
+// SA_RESTART: on at least macOS (and possibly other libcs), the legacy
+// signal(2) wrapper installs handlers with SA_RESTART implied, which
+// would make a blocked waitpid(2) transparently resume instead of
+// returning EINTR when a trapped signal arrives. That silently defeats
+// Executor::waitForChild()'s whole reason for existing - the trap would
+// still eventually run, but only once the foreground child happened to
+// exit on its own, not promptly when the signal arrived. Verified by
+// hand: the difference between a "caught" message that took 10 real
+// seconds to appear (buffered stdio makes it look prompt from output
+// alone) versus one that actually interrupts a `sleep 10` immediately.
+void installSignalDisposition(int signum, void (*handler)(int)) {
+    struct sigaction sa {};
+    sigemptyset(&sa.sa_mask);  // a macro on some platforms (e.g. macOS) - no "::" prefix
+    sa.sa_flags = 0;
+    sa.sa_handler = handler;
+    ::sigaction(signum, &sa, nullptr);
 }
 
 // A foreground child (external program, pipeline stage, or subshell)
@@ -128,6 +148,74 @@ private:
 // ---------------------------------------------------------------------
 
 Executor::Executor(Environment& env) : env_(env), expander_(env, this) {}
+
+// ---------------------------------------------------------------------
+// trap (§2.14 trap, §2.11)
+// ---------------------------------------------------------------------
+
+void Executor::setTrap(int signum, std::string action) {
+    if (signum != 0) {
+        installSignalDisposition(signum, action.empty() ? SIG_IGN : trapSignalHandler);
+    }
+    trapActions_[signum] = std::move(action);
+}
+
+void Executor::unsetTrap(int signum) {
+    trapActions_.erase(signum);
+    if (signum != 0) installSignalDisposition(signum, SIG_DFL);
+}
+
+std::optional<std::string> Executor::trapAction(int signum) const {
+    auto it = trapActions_.find(signum);
+    if (it == trapActions_.end()) return std::nullopt;
+    return it->second;
+}
+
+std::vector<int> Executor::trappedSignals() const {
+    std::vector<int> result;
+    for (const auto& [signum, action] : trapActions_) result.push_back(signum);
+    return result;
+}
+
+void Executor::servicePendingTraps() {
+    // Copy out what needs running before running any of it: an action
+    // could itself call `trap` again (mutating trapActions_), which must
+    // not invalidate the iteration above it.
+    std::vector<std::pair<int, std::string>> toRun;
+    for (const auto& [signum, action] : trapActions_) {
+        if (signum == 0 || signum >= kMaxTrapSignal || !g_pendingSignal[signum]) continue;
+        g_pendingSignal[signum] = 0;
+        if (!action.empty()) toRun.emplace_back(signum, action);
+    }
+    for (const auto& [signum, action] : toRun) {
+        (void)signum;
+        runSourceInCurrentContext(action);
+    }
+}
+
+int Executor::runExitTrapIfSet(int currentStatus) {
+    auto it = trapActions_.find(0);
+    if (it == trapActions_.end() || it->second.empty()) return currentStatus;
+    std::string action = std::move(it->second);
+    trapActions_.erase(it);  // avoid re-entering if the action itself calls `exit`
+    env_.lastExitStatus = currentStatus;  // so the trap body's own $? sees it
+    try {
+        runSourceInCurrentContext(action);
+    } catch (const ExitSignal& e) {
+        return e.status & 0xFF;  // the trap explicitly called exit: it wins
+    } catch (...) {
+        // A broken exit trap shouldn't prevent the shell from exiting.
+    }
+    return currentStatus;
+}
+
+pid_t Executor::waitForChild(pid_t pid, int* status) {
+    while (true) {
+        pid_t r = ::waitpid(pid, status, 0);
+        if (r >= 0 || errno != EINTR) return r;
+        servicePendingTraps();
+    }
+}
 
 Executor::ProgramOutcome Executor::runProgramCatchingExit(const ast::List& program) {
     try {
@@ -215,7 +303,7 @@ std::string Executor::runAndCaptureStdout(const std::string& source) {
     ::close(pipefd[0]);
 
     int wstatus = 0;
-    waitpidRetry(pid, &wstatus, 0);
+    waitForChild(pid, &wstatus);
     env_.lastExitStatus = statusFromWait(wstatus);
     return output;
 }
@@ -250,6 +338,12 @@ int Executor::runList(const ast::List& list) {
 }
 
 int Executor::runAndOr(const ast::AndOr& andOr) {
+    // Most trap-servicing happens naturally inside waitForChild() while
+    // blocked on a foreground child, but a tight loop of pure builtins
+    // (e.g. "while true; do :; done") never blocks there at all - check
+    // here too, once per pipeline-level unit, so a trapped signal still
+    // gets serviced promptly in that case.
+    servicePendingTraps();
     int status = runPipeline(andOr.first);
     env_.lastExitStatus = status;
     for (const auto& [isAnd, pipeline] : andOr.rest) {
@@ -305,7 +399,7 @@ int Executor::runPipeline(const ast::Pipeline& pipeline) {
         int lastStatus = 1;
         for (std::size_t i = 0; i < n; ++i) {
             int wstatus = 0;
-            waitpidRetry(pids[i], &wstatus, 0);
+            waitForChild(pids[i], &wstatus);
             if (i + 1 == n) lastStatus = statusFromWait(wstatus);
         }
         status = lastStatus;
@@ -508,7 +602,7 @@ int Executor::execExternal(const std::string& name, const std::vector<std::strin
     }
 
     int wstatus = 0;
-    waitpidRetry(pid, &wstatus, 0);
+    waitForChild(pid, &wstatus);
     return statusFromWait(wstatus);
 }
 
@@ -611,7 +705,7 @@ int Executor::runSubshell(const ast::Subshell& sh) {
         exitChild(status);
     }
     int wstatus = 0;
-    waitpidRetry(pid, &wstatus, 0);
+    waitForChild(pid, &wstatus);
     return statusFromWait(wstatus);
 }
 
