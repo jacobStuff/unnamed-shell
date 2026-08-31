@@ -79,4 +79,4 @@ roadmap in [docs/DESIGN.md](docs/DESIGN.md#status--roadmap).
 
 ## License
 
-TBD (likely GPL).
+The Unlicense
