@@ -2,6 +2,7 @@ add_executable(ush_tests
     lexer/test_lexer.cpp
     parser/test_parser.cpp
     runtime/test_environment.cpp
+    runtime/test_history.cpp
     expand/test_arithmetic.cpp
     expand/test_expander.cpp
     expand/test_field_split.cpp

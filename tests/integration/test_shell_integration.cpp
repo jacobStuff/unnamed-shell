@@ -10,11 +10,17 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <util.h>  // forkpty()
+#else
+#include <pty.h>  // forkpty()
+#endif
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -33,7 +39,15 @@ struct RunResult {
     int status;
 };
 
-RunResult runUshWithArgv(const std::vector<std::string>& args, const std::string& stdinContent) {
+// Every test process inherits the real $HOME - without setting HISTFILE
+// explicitly, an interactive run would default it to the *actual* user's
+// ~/.ush_history and load/save it for real. "/dev/null" (the default
+// here) makes history purely in-memory for the test: load() finds
+// nothing, save() writes harmlessly nowhere. A test that specifically
+// wants to exercise persistence passes a real (temp-directory) path
+// instead.
+RunResult runUshWithArgv(const std::vector<std::string>& args, const std::string& stdinContent,
+                          const std::string& histFile = "/dev/null") {
     int outPipe[2];
     REQUIRE(::pipe(outPipe) == 0);
     int inPipe[2];
@@ -50,6 +64,7 @@ RunResult runUshWithArgv(const std::vector<std::string>& args, const std::string
         ::close(inPipe[1]);
         ::close(outPipe[0]);
         ::close(outPipe[1]);
+        ::setenv("HISTFILE", histFile.c_str(), 1);
 
         std::vector<char*> argv;
         for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
@@ -97,6 +112,10 @@ RunResult runUshInteractive(const std::string& stdinScript) {
     return runUshWithArgv({USH_BINARY_PATH, "-i"}, stdinScript);
 }
 
+RunResult runUshInteractive(const std::string& stdinScript, const std::string& histFile) {
+    return runUshWithArgv({USH_BINARY_PATH, "-i"}, stdinScript, histFile);
+}
+
 // A live `ush -i` session with its stdin/stdout as pipes the test can
 // drive incrementally - needed for job-control tests, which have to read
 // a job's announced pid from mid-session output before they can send it
@@ -105,7 +124,9 @@ RunResult runUshInteractive(const std::string& stdinScript) {
 // the end).
 class InteractiveSession {
 public:
-    InteractiveSession() {
+    // `histFile`: see runUshWithArgv()'s identical parameter - defaults
+    // to /dev/null so this never touches the real user's ~/.ush_history.
+    explicit InteractiveSession(const std::string& histFile = "/dev/null") {
         int inPipe[2], outPipe[2];
         REQUIRE(::pipe(inPipe) == 0);
         REQUIRE(::pipe(outPipe) == 0);
@@ -119,6 +140,7 @@ public:
             ::close(inPipe[1]);
             ::close(outPipe[0]);
             ::close(outPipe[1]);
+            ::setenv("HISTFILE", histFile.c_str(), 1);
             std::vector<std::string> args = {USH_BINARY_PATH, "-i"};
             std::vector<char*> argv;
             for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
@@ -206,6 +228,88 @@ public:
 
 private:
     fs::path path_;
+};
+
+// A live `ush -i` session connected to a real pseudo-terminal rather than
+// pipes - needed to exercise the raw-mode line editor at all
+// (LineEditor::isUsable() requires stdin/stdout to actually be a tty;
+// InteractiveSession's pipes deliberately fall back to plain line
+// reading, like `ush -i < script`). sendRaw() writes bytes with no
+// automatic newline, so a test can send arrow keys/control characters,
+// not just whole lines.
+class PtySession {
+public:
+    explicit PtySession(const std::string& histFile = "/dev/null") {
+        pid_ = ::forkpty(&fd_, nullptr, nullptr, nullptr);
+        REQUIRE(pid_ >= 0);
+        if (pid_ == 0) {
+            ::setenv("HISTFILE", histFile.c_str(), 1);
+            ::setenv("TERM", "xterm", 1);
+            std::vector<std::string> args = {USH_BINARY_PATH, "-i"};
+            std::vector<char*> argv;
+            for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+            argv.push_back(nullptr);
+            ::execv(USH_BINARY_PATH, argv.data());
+            _exit(127);
+        }
+    }
+    ~PtySession() {
+        if (fd_ >= 0) ::close(fd_);
+        if (pid_ > 0) {
+            ::kill(pid_, SIGKILL);
+            int wstatus = 0;
+            ::waitpid(pid_, &wstatus, 0);
+        }
+    }
+
+    void sendRaw(const std::string& bytes) { ::write(fd_, bytes.data(), bytes.size()); }
+    // A whole line of plain text, terminated with Enter - '\r' (not
+    // '\n') is what a real terminal in cbreak/canonical mode sends for
+    // the Enter key, and what the line editor's readLine() looks for.
+    void sendLine(const std::string& text) { sendRaw(text + "\r"); }
+
+    std::string readAvailable(int timeoutMs = 2000) {
+        std::string result;
+        char buf[4096];
+        while (true) {
+            struct pollfd pfd {
+                fd_, POLLIN, 0
+            };
+            int r = ::poll(&pfd, 1, timeoutMs);
+            if (r <= 0 || !(pfd.revents & POLLIN)) break;
+            ssize_t n = ::read(fd_, buf, sizeof(buf));
+            if (n <= 0) break;
+            result.append(buf, static_cast<std::size_t>(n));
+        }
+        return result;
+    }
+
+    int finish() {
+        sendLine("exit");
+        // Keep draining until the child actually exits: its own
+        // terminal-mode-restore can (harmlessly, in production - see
+        // RawMode's TCSANOW comment in line_editor.cpp) still have
+        // output queued that nothing has read yet, and some ptys/kernels
+        // are happy to let queued-but-unread output pile up indefinitely
+        // regardless. readAvailable()'s short timeout keeps this from
+        // blocking once the child is actually gone.
+        int wstatus = 0;
+        pid_t r;
+        do {
+            readAvailable(100);
+            r = ::waitpid(pid_, &wstatus, WNOHANG);
+        } while (r == 0);
+        while (r < 0 && errno == EINTR) {
+            r = ::waitpid(pid_, &wstatus, 0);
+        }
+        pid_t donePid = pid_;
+        pid_ = -1;
+        return r == donePid && WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : (128 + WTERMSIG(wstatus));
+    }
+
+private:
+    pid_t pid_ = -1;
+    int fd_ = -1;
 };
 
 }  // namespace
@@ -727,4 +831,152 @@ TEST_CASE("fg brings a background job to the foreground and waits for it",
     CHECK(out.find("Stopped") == std::string::npos);
 
     s.finish();
+}
+
+// --- history / fc --------------------------------------------------------
+
+TEST_CASE("a non-interactive run never builds a history list", "[integration]") {
+    auto r = runUsh("echo one; echo two; fc -l");
+    CHECK(r.output.find("one") != std::string::npos);
+    CHECK(r.output.find("two") != std::string::npos);
+    // fc -l with nothing recorded reports an empty history, not a crash
+    // or a listing of "echo one"/"echo two" themselves.
+    CHECK(r.output.find("history is empty") != std::string::npos);
+}
+
+TEST_CASE("fc -l lists previously run interactive commands, numbered", "[integration]") {
+    InteractiveSession s;
+    s.readAvailable();
+    s.send("echo one");
+    s.readAvailable();
+    s.send("echo two");
+    s.readAvailable();
+    s.send("fc -l");
+    std::string out = s.readAvailable();
+    s.finish();
+    CHECK(out.find("1  echo one") != std::string::npos);
+    CHECK(out.find("2  echo two") != std::string::npos);
+}
+
+TEST_CASE("history builtin lists the same entries as fc -l", "[integration]") {
+    InteractiveSession s;
+    s.readAvailable();
+    s.send("echo hi");
+    s.readAvailable();
+    s.send("history");
+    std::string out = s.readAvailable();
+    s.finish();
+    CHECK(out.find("1  echo hi") != std::string::npos);
+}
+
+TEST_CASE("fc -s re-executes the previous command", "[integration]") {
+    InteractiveSession s;
+    s.readAvailable();
+    s.send("echo original");
+    s.readAvailable();
+    s.send("fc -s");
+    std::string out = s.readAvailable();
+    s.finish();
+    // fc -s echoes the command before running it, then runs it - "original"
+    // should appear twice: once from fc's echo, once from actually running it.
+    std::size_t first = out.find("original");
+    REQUIRE(first != std::string::npos);
+    CHECK(out.find("original", first + 1) != std::string::npos);
+}
+
+TEST_CASE("fc -s applies an old=new substitution", "[integration]") {
+    InteractiveSession s;
+    s.readAvailable();
+    s.send("echo hello");
+    s.readAvailable();
+    s.send("fc -s hello=goodbye");
+    std::string out = s.readAvailable();
+    s.finish();
+    CHECK(out.find("goodbye") != std::string::npos);
+}
+
+TEST_CASE("history persists across sessions via HISTFILE", "[integration]") {
+    TempDir dir;
+    std::string histFile = (dir.path() / "hist").string();
+
+    {
+        InteractiveSession s(histFile);
+        s.readAvailable();
+        s.send("echo from-session-one");
+        s.readAvailable();
+        s.finish();
+    }
+
+    auto r = runUshInteractive("fc -l\n", histFile);
+    CHECK(r.output.find("echo from-session-one") != std::string::npos);
+}
+
+// --- interactive line editing (real pty) ----------------------------------
+
+TEST_CASE("line editor: left arrow plus backspace edit a command before it runs",
+          "[integration]") {
+    PtySession s;
+    s.readAvailable();
+    // Type "echo XY", move left one (before the Y), backspace (removes
+    // the X) - "echo Y" should be what actually runs.
+    s.sendRaw("echo XY");
+    s.readAvailable(300);
+    s.sendRaw("\x1b[D");
+    s.readAvailable(300);
+    s.sendRaw("\x7f");
+    s.readAvailable(300);
+    s.sendRaw("\r");
+    std::string out = s.readAvailable();
+    s.finish();
+    CHECK(out.find("\nY") != std::string::npos);
+    CHECK(out.find("XY") == std::string::npos);
+}
+
+TEST_CASE("line editor: up arrow recalls the previous command", "[integration]") {
+    PtySession s;
+    std::string out = s.readAvailable();
+    s.sendLine("echo first");
+    out += s.readAvailable();
+    s.sendRaw("\x1b[A");  // up arrow: recall "echo first"
+    out += s.readAvailable(300);
+    s.sendRaw("\r");
+    out += s.readAvailable();
+    s.finish();
+    // "first" should appear twice across the whole transcript: once from
+    // actually running it, once more from the recalled re-run.
+    std::size_t at = out.find("first");
+    REQUIRE(at != std::string::npos);
+    CHECK(out.find("first", at + 1) != std::string::npos);
+}
+
+TEST_CASE("line editor: Ctrl-A then Ctrl-K clears a typed line before it runs", "[integration]") {
+    PtySession s;
+    s.readAvailable();
+    s.sendRaw("echo REMOVE_ME");
+    s.readAvailable(300);
+    s.sendRaw("\x01");  // Ctrl-A: start of line
+    s.readAvailable(300);
+    s.sendRaw("\x0b");  // Ctrl-K: kill to end
+    s.readAvailable(300);
+    s.sendLine("echo kept");
+    std::string out = s.readAvailable();
+    s.finish();
+    CHECK(out.find("kept") != std::string::npos);
+    CHECK(out.find("REMOVE_ME") == std::string::npos);
+}
+
+TEST_CASE("line editor: Ctrl-C aborts the current line without exiting the shell",
+          "[integration]") {
+    PtySession s;
+    s.readAvailable();
+    s.sendRaw("echo not_run");
+    s.readAvailable(300);
+    s.sendRaw("\x03");  // Ctrl-C
+    s.readAvailable(500);
+    s.sendLine("echo still_alive");
+    std::string out = s.readAvailable();
+    int status = s.finish();
+    CHECK(out.find("not_run") == std::string::npos);
+    CHECK(out.find("still_alive") != std::string::npos);
+    CHECK(status == 0);
 }

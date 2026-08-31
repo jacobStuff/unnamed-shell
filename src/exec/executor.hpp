@@ -26,6 +26,7 @@
 
 #include "ast/ast.hpp"
 #include "expand/expander.hpp"
+#include "runtime/history.hpp"
 
 namespace ush {
 
@@ -178,6 +179,16 @@ public:
     // otherwise leaves it running in the background. Used by `fg`/`bg`.
     int resumeJob(Job& job, bool foreground);
 
+    // --- history (fc, HISTFILE/HISTSIZE) ---------------------------------
+    //
+    // Owned here (rather than by main.cpp's interactive loop alone) so
+    // the `fc`/`history` built-ins can reach it like any other piece of
+    // shell state. A non-interactive run never touches this - it's simply
+    // never loaded, added to, or saved - so `fc`/`history` in a script see
+    // an empty list, which matches "history doesn't really apply outside
+    // interactive use."
+    History& history() { return history_; }
+
 private:
     Environment& env_;
     Expander expander_;
@@ -192,6 +203,8 @@ private:
 
     std::vector<Job> jobs_;
     int nextJobId_ = 1;
+
+    History history_;
 
     // True only in the actual, top-level interactive shell process -
     // explicitly cleared to false in every forked child (right after

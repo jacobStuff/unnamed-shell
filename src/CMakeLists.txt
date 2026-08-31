@@ -18,9 +18,11 @@ target_link_libraries(ush_parser PUBLIC ush_lexer)
 target_compile_features(ush_parser PUBLIC cxx_std_20)
 
 # ush_runtime: shell variable/parameter state (§2.5), used by expansion
-# and (later) execution.
+# and execution, plus the interactive command history list (fc,
+# HISTFILE/HISTSIZE) that the executor and the line editor both need.
 add_library(ush_runtime STATIC
     runtime/environment.cpp
+    runtime/history.cpp
 )
 target_include_directories(ush_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(ush_runtime PUBLIC cxx_std_20)
@@ -50,7 +52,18 @@ target_include_directories(ush_exec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ush_exec PUBLIC ush_parser ush_expand)
 target_compile_features(ush_exec PUBLIC cxx_std_20)
 
+# ush_interactive: the raw-mode line editor used at the interactive
+# prompt (cursor movement, in-place editing, arrow-key history recall).
+# Depends on ush_exec for Executor (trap state, History, and
+# servicePendingTraps() - see line_editor.cpp).
+add_library(ush_interactive STATIC
+    interactive/line_editor.cpp
+)
+target_include_directories(ush_interactive PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ush_interactive PUBLIC ush_exec)
+target_compile_features(ush_interactive PUBLIC cxx_std_20)
+
 add_executable(ush
     main.cpp
 )
-target_link_libraries(ush PRIVATE ush_exec)
+target_link_libraries(ush PRIVATE ush_interactive)

@@ -23,6 +23,7 @@
 #include "expand/expander.hpp"
 #include "expand/field_split.hpp"
 #include "runtime/environment.hpp"
+#include "runtime/history.hpp"
 
 namespace ush {
 
@@ -58,6 +59,59 @@ Executor::Job* resolveJobSpec(Executor& ex, const std::string& spec) {
     } catch (...) {
     }
     return nullptr;
+}
+
+// Resolves an `fc` history operand to a concrete history number: a plain
+// positive integer is that history number directly; a negative integer
+// is relative to the most recent command (-1 == the previous command);
+// anything else is taken as a string and matched against the most recent
+// history entry that starts with it (POSIX's "reference by string" form).
+// Returns nullopt if it doesn't resolve to anything currently retained.
+std::optional<std::size_t> resolveHistRef(const History& h, const std::string& ref) {
+    if (ref.empty() || h.empty()) return std::nullopt;
+    bool neg = ref[0] == '-';
+    std::size_t digitsStart = neg ? 1 : 0;
+    bool allDigits = digitsStart < ref.size();
+    for (std::size_t k = digitsStart; k < ref.size(); ++k) {
+        if (!std::isdigit(static_cast<unsigned char>(ref[k]))) {
+            allDigits = false;
+            break;
+        }
+    }
+    if (allDigits) {
+        long n;
+        try {
+            n = std::stol(ref);
+        } catch (...) {
+            return std::nullopt;
+        }
+        if (n < 0) {
+            long resolved = static_cast<long>(h.lastNumber()) + n;
+            if (resolved < static_cast<long>(h.firstNumber())) return std::nullopt;
+            return static_cast<std::size_t>(resolved);
+        }
+        if (n == 0) return std::nullopt;
+        return h.byNumber(static_cast<std::size_t>(n)) ? std::optional<std::size_t>(n) : std::nullopt;
+    }
+    for (std::size_t num = h.lastNumber(); num >= h.firstNumber(); --num) {
+        const std::string* s = h.byNumber(num);
+        if (s && s->rfind(ref, 0) == 0) return num;
+        if (num == h.firstNumber()) break;  // avoid size_t underflow past 0
+    }
+    return std::nullopt;
+}
+
+// The history number of "the previous command" for `fc`'s default operand
+// (used whenever `first`/`last` - or `fc -s`'s command reference - is
+// omitted): NOT simply the newest entry in the list, because by the time
+// this runs, `fc`'s own invocation has already been recorded as that
+// newest entry (history recording happens before a parsed command is
+// executed - see main.cpp). "The previous command" means the one before
+// that, i.e. lastNumber() - 1. Returns nullopt if there isn't one (an
+// empty history, or the `fc` invocation itself is the only entry).
+std::optional<std::size_t> previousCommandNumber(const History& h) {
+    if (h.lastNumber() <= h.firstNumber()) return std::nullopt;
+    return h.lastNumber() - 1;
 }
 
 // Shared by `trap` and `kill`. Covers the signals standardized by POSIX
@@ -1048,6 +1102,224 @@ int biBg(Executor& ex, const std::vector<std::string>& args) {
     return ex.resumeJob(*job, /*foreground=*/false);
 }
 
+// `history [-c] [n]`: not itself a POSIX built-in (the standard interface
+// is `fc -l`, below), but a widely-expected convenience now that ush has
+// a real history list to show. With no operands, lists every retained
+// entry; `-c` clears the list; a bare `n` lists only the last `n`.
+int biHistory(Executor& ex, const std::vector<std::string>& args) {
+    History& hist = ex.history();
+    if (args.size() > 1 && args[1] == "-c") {
+        hist.setMaxSize(0);  // drop everything retained...
+        hist.setMaxSize(500);
+        // ...then put a real cap back (matches the default in main.cpp;
+        // setMaxSize(0) alone would mean "unlimited" from here on, not
+        // "cleared").
+        return 0;
+    }
+    std::size_t from = hist.firstNumber();
+    if (args.size() > 1) {
+        int n = parseIntArg(args[1], -1);
+        if (n < 0) {
+            std::fprintf(stderr, "ush: history: %s: numeric argument required\n", args[1].c_str());
+            return 2;
+        }
+        std::size_t want = static_cast<std::size_t>(n);
+        if (want < hist.size()) from = hist.lastNumber() - want + 1;
+    }
+    for (std::size_t num = from; num <= hist.lastNumber(); ++num) {
+        const std::string* s = hist.byNumber(num);
+        if (s) std::printf("%5zu  %s\n", num, s->c_str());
+    }
+    return 0;
+}
+
+// `fc [-r] [-e editor] [first [last]]` (edit a range of history commands
+// and re-execute the result), `fc -l [-nr] [first [last]]` (list instead
+// of editing), `fc -s [old=new] [first]` (re-execute directly, with an
+// optional textual substitution, no editor involved) - POSIX's interface
+// to the history list. `first`/`last` (and `-s`'s `first`) each name a
+// history entry: a plain number, a negative number (relative to the most
+// recent command), or a string (the most recent command starting with
+// it) - see resolveHistRef().
+int biFc(Executor& ex, const std::vector<std::string>& args) {
+    bool listMode = false, suppressNumbers = false, reverse = false, subMode = false;
+    std::string editorOverride;
+    std::size_t i = 1;
+    for (; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a.empty() || a[0] != '-' || a == "-") break;
+        if (a == "-l") {
+            listMode = true;
+        } else if (a == "-n") {
+            suppressNumbers = true;
+        } else if (a == "-r") {
+            reverse = true;
+        } else if (a == "-s") {
+            subMode = true;
+        } else if (a == "-e") {
+            if (++i >= args.size()) {
+                std::fprintf(stderr, "ush: fc: -e: option requires an argument\n");
+                return 2;
+            }
+            editorOverride = args[i];
+        } else {
+            std::fprintf(stderr, "ush: fc: %s: invalid option\n", a.c_str());
+            return 2;
+        }
+    }
+    std::vector<std::string> operands(args.begin() + static_cast<std::ptrdiff_t>(i), args.end());
+    History& hist = ex.history();
+
+    if (subMode) {
+        std::string oldStr, newStr, ref;
+        bool hasSub = false;
+        for (const auto& op : operands) {
+            auto eq = op.find('=');
+            if (!hasSub && eq != std::string::npos) {
+                oldStr = op.substr(0, eq);
+                newStr = op.substr(eq + 1);
+                hasSub = true;
+            } else {
+                ref = op;
+            }
+        }
+        std::optional<std::size_t> num = ref.empty() ? previousCommandNumber(hist) : resolveHistRef(hist, ref);
+        if (!num) {
+            std::fprintf(stderr, "ush: fc: %s: no such command\n", ref.empty() ? "(none)" : ref.c_str());
+            return 1;
+        }
+        std::string cmd = *hist.byNumber(*num);
+        if (hasSub && !oldStr.empty()) {
+            auto pos = cmd.find(oldStr);
+            if (pos != std::string::npos) cmd = cmd.substr(0, pos) + newStr + cmd.substr(pos + oldStr.size());
+        }
+        std::printf("%s\n", cmd.c_str());
+        std::fflush(stdout);
+        hist.add(cmd);
+        return ex.runSourceInCurrentContext(cmd);
+    }
+
+    std::size_t firstNum, lastNum;
+    bool rangeGivenDescending = false;
+    if (operands.empty()) {
+        if (hist.empty()) {
+            std::fprintf(stderr, "ush: fc: history is empty\n");
+            return 1;
+        }
+        if (listMode) {
+            firstNum = hist.size() > 16 ? hist.lastNumber() - 15 : hist.firstNumber();
+            lastNum = hist.lastNumber();
+        } else {
+            auto prev = previousCommandNumber(hist);
+            if (!prev) {
+                std::fprintf(stderr, "ush: fc: no previous command\n");
+                return 1;
+            }
+            firstNum = lastNum = *prev;
+        }
+    } else if (operands.size() == 1) {
+        auto n = resolveHistRef(hist, operands[0]);
+        if (!n) {
+            std::fprintf(stderr, "ush: fc: %s: no such command\n", operands[0].c_str());
+            return 1;
+        }
+        firstNum = *n;
+        lastNum = listMode ? hist.lastNumber() : *n;
+    } else {
+        auto n1 = resolveHistRef(hist, operands[0]);
+        auto n2 = resolveHistRef(hist, operands[1]);
+        if (!n1 || !n2) {
+            std::fprintf(stderr, "ush: fc: %s: no such command\n",
+                         (!n1 ? operands[0] : operands[1]).c_str());
+            return 1;
+        }
+        rangeGivenDescending = *n1 > *n2;
+        firstNum = std::min(*n1, *n2);
+        lastNum = std::max(*n1, *n2);
+    }
+    bool descending = reverse != rangeGivenDescending;
+
+    std::vector<std::size_t> nums;
+    for (std::size_t n = firstNum; n <= lastNum; ++n) nums.push_back(n);
+    if (descending) std::reverse(nums.begin(), nums.end());
+
+    if (listMode) {
+        for (std::size_t n : nums) {
+            const std::string* s = hist.byNumber(n);
+            if (!s) continue;
+            if (suppressNumbers) {
+                std::printf("%s\n", s->c_str());
+            } else {
+                std::printf("%5zu  %s\n", n, s->c_str());
+            }
+        }
+        return 0;
+    }
+
+    // Edit mode: write the selected commands to a temp file, run an
+    // editor on it, then execute whatever comes back.
+    std::string editor = editorOverride;  // POSIX's default editor is
+                                           // unspecified - "vi" below is a
+                                           // documented, deliberate choice
+    if (editor.empty()) {
+        if (auto fcedit = ex.env().get("FCEDIT")) {
+            editor = *fcedit;
+        } else if (auto e = ex.env().get("EDITOR")) {
+            editor = *e;
+        } else {
+            editor = "vi";
+        }
+    }
+    char tmpl[] = "/tmp/ush_fc_XXXXXX";
+    int fd = ::mkstemp(tmpl);
+    if (fd < 0) {
+        std::fprintf(stderr, "ush: fc: %s\n", std::strerror(errno));
+        return 1;
+    }
+    {
+        std::string content;
+        for (std::size_t n : nums) {
+            const std::string* s = hist.byNumber(n);
+            if (s) {
+                content += *s;
+                content += '\n';
+            }
+        }
+        ::write(fd, content.data(), content.size());
+        ::close(fd);
+    }
+
+    pid_t pid = ::fork();
+    if (pid == 0) {
+        std::vector<char*> argv = {const_cast<char*>(editor.c_str()), tmpl, nullptr};
+        ::execvp(editor.c_str(), argv.data());
+        _exit(127);
+    }
+    int edited = 1;
+    if (pid > 0) {
+        int wstatus = 0;
+        pid_t r;
+        while ((r = ::waitpid(pid, &wstatus, 0)) < 0 && errno == EINTR) {
+        }
+        edited = (r == pid && WIFEXITED(wstatus)) ? WEXITSTATUS(wstatus) : 1;
+    }
+
+    std::ifstream in(tmpl);
+    std::ostringstream ss;
+    if (in) ss << in.rdbuf();
+    ::unlink(tmpl);
+
+    if (edited != 0) {
+        std::fprintf(stderr, "ush: fc: editor exited nonzero; not executing\n");
+        return edited;
+    }
+    std::string finalSource = ss.str();
+    std::printf("%s", finalSource.c_str());
+    std::fflush(stdout);
+    hist.add(finalSource);
+    return ex.runSourceInCurrentContext(finalSource);
+}
+
 // --- registry -----------------------------------------------------------
 
 const std::unordered_set<std::string>& specialBuiltinNames() {
@@ -1076,6 +1348,7 @@ const std::unordered_map<std::string, BuiltinFunc>& builtinTable() {
         {"type", biType},       {"getopts", biGetopts}, {"wait", biWait},
         {"umask", biUmask},     {"kill", biKill},
         {"jobs", biJobs},       {"fg", biFg},           {"bg", biBg},
+        {"fc", biFc},           {"history", biHistory},
     };
     return table;
 }

@@ -33,13 +33,16 @@ echo 'echo hi' | ./build/src/ush              # run a script from stdin (non-int
 
 Interactive mode has a real prompt (`PS1`/`PS2`, both expanded like any
 other word), multi-line continuation for anything left unfinished
-(an open quote, an `if` without its `fi` yet, a trailing `&&`, ...), and
+(an open quote, an `if` without its `fi` yet, a trailing `&&`, ...),
 job control (`&` to background, `Ctrl-Z` to stop the foreground job,
 `jobs`/`fg`/`bg`/`kill %n`/`wait %n` to manage it, with terminal control
-handed back and forth between the shell and each foreground job), but
-no arrow-key history/cursor movement beyond what the terminal's own
-canonical line mode provides for free (backspace, `^U`, `^W`) - see the
-roadmap.
+handed back and forth between the shell and each foreground job), and a
+real line editor on an actual terminal: cursor movement (arrow keys,
+`Ctrl-A`/`Ctrl-E`/`Ctrl-B`/`Ctrl-F`, Home/End), in-place editing
+(backspace, Delete, `Ctrl-K`/`Ctrl-U`/`Ctrl-W` kill plus `Ctrl-Y` yank,
+`Ctrl-L` to redraw), and history recall (arrow keys or `Ctrl-P`/`Ctrl-N`,
+backed by a real history list - `fc`, `history`, `HISTFILE`/`HISTSIZE`).
+`Ctrl-C` aborts the line you're typing rather than the shell itself.
 
 ## Status
 
@@ -54,19 +57,22 @@ interactive REPL (prompts, multi-line continuation, `Ctrl-C` no longer
 killing the shell), real trap/signal handling (`trap`, an `EXIT`
 handler that runs exactly once, and signals that interrupt a running
 foreground command promptly rather than waiting for it to finish first),
-and job control (process groups, terminal-control handoff via
-`tcsetpgrp`, `Ctrl-Z` to stop a foreground job, and a real job table
-backing `jobs`/`fg`/`bg`/`kill %n`/`wait %n`). Built-ins: every POSIX
-special built-in, plus a practical regular set - `cd`, `pwd`, `echo`,
-`printf`, `read`, `test`/`[`, `true`, `false`, `command`, `type`,
-`getopts`, `wait`, `umask`, `kill`, `jobs`, `fg`, `bg`. Done and tested:
-935 assertions across 184 cases, including integration tests that run
-the actual built binary end to end (interactively too, via `-i`,
-including sending real signals - both to interrupt a running child and
-to stop/continue a whole job's process group).
+job control (process groups, terminal-control handoff via `tcsetpgrp`,
+`Ctrl-Z` to stop a foreground job, and a real job table backing
+`jobs`/`fg`/`bg`/`kill %n`/`wait %n`), and a raw-mode line editor with
+arrow-key/`Ctrl-P`/`Ctrl-N` history recall backed by a real command
+history. Built-ins: every POSIX special built-in, plus a practical
+regular set - `cd`, `pwd`, `echo`, `printf`, `read`, `test`/`[`, `true`,
+`false`, `command`, `type`, `getopts`, `wait`, `umask`, `kill`, `jobs`,
+`fg`, `bg`, `fc` (list/edit-and-reexecute/quick-reexecute a range of
+history), `history`. Done and tested: 1016 assertions across 204 cases,
+including integration tests that run the actual built binary end to end
+(interactively too, via `-i` and, for the line editor specifically, over
+a real pseudo-terminal - sending real signals, including to interrupt a
+running child and to stop/continue a whole job's process group).
 
 Still to come: a couple of niche built-ins (`hash`, `alias`/`unalias`),
-real line editing/history (arrow-key recall, cursor movement),
+completion, a real vi editing mode (`set -o vi`/`-o emacs` are no-ops),
 `SIGTTIN`/`SIGTTOU`-driven suspension of background jobs that touch the
 terminal, and a proper `%+`/`%-` distinction between jobs. See the
 roadmap in [docs/DESIGN.md](docs/DESIGN.md#status--roadmap).

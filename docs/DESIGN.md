@@ -315,6 +315,82 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   unquoted literal (any quoting or expansion) prints as `...`, and a
   compound command prints as a generic `{ ... }`. Good enough to tell
   jobs apart by eye; not intended to reproduce the exact source.
+- **`Ctrl-C` while the line editor is reading a key either aborts the
+  line or defers to a user `trap`, depending on which was already
+  true when `readLine()` started - never both, and never neither.**
+  `LineEditor` doesn't install its own `SIGINT` handler unconditionally:
+  it first asks `Executor::trapAction(SIGINT)`. If no trap is set (the
+  common case - the shell's own default disposition is `SIG_IGN`, from
+  `main.cpp`), it installs a small temporary handler (own
+  `sig_atomic_t` flag, mirroring the pattern in executor.cpp) for the
+  duration of the read, so a blocking `read(2)` sees `EINTR` and the
+  editor can abort the current (possibly multi-line) input and return
+  to a fresh prompt - the behavior every interactive shell's line
+  editor has. If a trap *is* set, that installation is skipped
+  entirely: the trap's own handler (installed by `Executor::setTrap`)
+  stays in place untouched, `read(2)` still sees `EINTR` from it (same
+  `sigaction`-without-`SA_RESTART` discipline), and the editor's
+  `readByte()` calls `Executor::servicePendingTraps()` to run the
+  trap's action right then - then just retries the read, keeping
+  whatever was typed so far, rather than discarding it. This means an
+  `INT` trap fires promptly even while sitting at the prompt typing
+  (previously it wouldn't fire until the next blocked wait for a
+  foreground child, since nothing polled `servicePendingTraps()` at an
+  idle prompt at all) - a small but real improvement that fell out of
+  needing EINTR-driven interruption for the editor anyway. A trap
+  action that itself calls `exit` propagates as `ExitSignal` straight
+  out of `readByte()`/`readLine()` (the `RawMode`/`TempSigintHandler`
+  RAII guards restore the terminal/signal disposition correctly even
+  as it unwinds); `main.cpp`'s interactive loop has its own
+  `try`/`catch (const ExitSignal&)` around the whole loop body to catch
+  that specific case, distinct from the existing `outcome.exitRequested`
+  path (which only covers `exit` from an already-parsed command, not
+  from a trap firing between prompts).
+- **The line editor redraws the whole line on every keystroke rather
+  than diffing.** `LineEditor::redraw()` does `\r` + clear-to-end-of-
+  line + reprint prompt+buffer + reposition the cursor, unconditionally,
+  on every edit. Simple and correct for anything that fits on one
+  terminal row (the overwhelmingly common case for a shell command
+  line), but it doesn't account for line-wrap: a command long enough to
+  wrap across multiple terminal rows will redraw incorrectly, since
+  `\r` only returns to column 0 of the *current* row, not the row the
+  prompt started on. A real line editor (readline/zsh's ZLE) tracks
+  terminal width and cursor row explicitly; this one doesn't.
+- **Distinguishing a lone Escape keypress from the start of a real
+  escape sequence uses a timing heuristic, not a proper terminfo/
+  terminal-capability parse.** Arrow keys/Home/End/Delete all arrive as
+  multi-byte sequences starting with `ESC` (`0x1B`); a bare press of the
+  Escape key is just that one byte with nothing following. Since the
+  editor's main read loop blocks indefinitely (`VMIN=1`, `VTIME=0`) to
+  avoid busy-waiting between ordinary keystrokes, telling these apart
+  needs a *different* read call specifically after seeing an `ESC`:
+  `LineEditor::readByteTimed()` temporarily switches to `VMIN=0`/
+  `VTIME=n` (a tenths-of-a-second poll-style read) just for the
+  byte(s) that would complete a sequence, restoring the normal blocking
+  settings immediately after. In practice a real terminal's escape
+  sequence bytes arrive together in one burst well within the ~100-200ms
+  windows used here, so this reliably tells "lone Escape" (times out,
+  treated as a no-op) from "arrow key" (bytes arrive immediately)
+  without needing a real terminfo database - a pragmatic, if inexact,
+  substitute for one.
+- **Every test that spawns an interactive `ush` must set `HISTFILE`
+  itself, or it will load/save the real user's `~/.ush_history`.**
+  `historyFilePath()` in `main.cpp` falls back to `$HOME/.ush_history`
+  when `HISTFILE` is unset - correct behavior for a real shell, but a
+  test process still inherits the real `$HOME` from whoever is running
+  the test suite. Caught by hand (not a test) after the first job-
+  control-era test run silently wrote real-looking history entries into
+  the developer's actual `~/.ush_history` - every one of this test
+  file's spawn points (`runUshWithArgv`, `InteractiveSession`,
+  `PtySession`) now defaults its `histFile` parameter to `/dev/null`
+  (in-memory-only for the test: `load()` finds nothing, `save()` writes
+  harmlessly nowhere), with an explicit real temp path only where a test
+  specifically wants to exercise persistence.
+- **`fc`'s edit-mode default editor (`vi`, absent `-e`/`$FCEDIT`/
+  `$EDITOR`) is a documented choice, not something POSIX mandates.**
+  POSIX leaves `fc`'s default editor unspecified; this implementation
+  picks `vi` (present on essentially every POSIX system, unlike e.g.
+  `ed`) rather than trying to detect "the historical default."
 
 ## Status / roadmap
 
@@ -463,9 +539,16 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        a `%job` operand; with no argument, reaps *all* children), `umask`,
        `kill` (`-signal`/`-l`, plus a `%job` operand that signals the
        job's whole process group), `jobs` (`-l`), `fg`/`bg` (`%job`, or
-       the current job with no operand). **Not implemented**: `hash`,
-       `alias`/`unalias`.
-8. [~] Interactive mode (`src/main.cpp`'s `runInteractive`): a real REPL -
+       the current job with no operand), `fc` (`-l`/`-n`/`-r` to list;
+       `-e editor`/`$FCEDIT`/`$EDITOR` to edit-and-reexecute a range;
+       `-s [old=new]` to reexecute directly, with an optional textual
+       substitution - all three history-reference forms: a plain number,
+       a negative number relative to the most recent command, or a
+       string matched against the most recent command starting with it),
+       and `history` (not itself POSIX - a convenience listing/`-c`-
+       clearing wrapper around the same list `fc` uses). **Not
+       implemented**: `hash`, `alias`/`unalias`.
+8. [x] Interactive mode (`src/main.cpp`'s `runInteractive`): a real REPL -
        prompts with `PS1`/`PS2` (expanded the same as any other word:
        tilde/parameter/command/arithmetic + quote removal), reads and
        parses incrementally so a `PS2` continuation prompt appears for
@@ -487,10 +570,27 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        be a source of test flakiness rather than of confidence.
        Job control (see item 5) is fully wired up here too: `jobs`
        are announced/reported at the right points in this loop's own
-       prompt cycle. **Not implemented**: line editing beyond what the
-       terminal's own canonical mode provides for free (backspace, `^U`,
-       `^W` - but no arrow-key cursor movement or history recall), and a
-       real history list. `main.cpp` also supports
+       prompt cycle. A real raw-mode line editor
+       (`src/interactive/line_editor.cpp`, `LineEditor`) now sits in
+       front of every prompt when stdin/stdout are actual terminals
+       (`LineEditor::isUsable()`): cursor movement (`^A`/`^E`/`^B`/`^F`/
+       arrow keys/Home/End), in-place editing (backspace, Delete, `^K`/
+       `^U`/`^W` kill plus `^Y` yank, `^L` redraw), and arrow-key/`^P`/
+       `^N` recall through a real command history
+       (`src/runtime/history.hpp`, `Executor::history()`, `fc`/
+       `history` - item 7). `Ctrl-C` while editing aborts the current
+       (possibly multi-line) input and returns to a fresh prompt - see
+       the hard-corners note on how that coexists with a user `trap ...
+       INT`. History is recorded (and `HISTFILE`/`HISTSIZE` loaded/
+       saved) whenever interactive, whether or not the fancy editor
+       itself is active - piped/redirected stdin (`ush -i < script`,
+       and every non-pty integration test) still falls back to plain
+       line-at-a-time reading, matching real shells' behavior in the
+       same situation. **Not implemented**: completion (filename/
+       command), a real vi editing mode (`set -o vi`/`-o emacs` aren't
+       recognized as anything other than a no-op), and multi-byte
+       UTF-8-aware cursor movement (each byte counts as one column).
+       `main.cpp` also supports
        `ush -c 'cmd' [name [arg...]]` and `ush script [arg...]` for
        non-interactive use, and `ush -i` to force interactive mode
        without a real terminal (used by the integration tests, and a
@@ -520,10 +620,24 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        (matching what a terminal's Ctrl-Z actually does - a test bug
        where this was first sent to a single pid instead is exactly what
        led to finding the "double fork" stop-mirroring bug in item 5),
-       `jobs`/`bg`/`fg`, and `wait %job`/`kill %job`.
+       `jobs`/`bg`/`fg`, and `wait %job`/`kill %job`. Line editing gets
+       its own `PtySession` helper - a live `ush -i` connected to a real
+       pseudo-terminal (`forkpty(3)`), not pipes, since
+       `LineEditor::isUsable()` requires stdin/stdout to actually be a
+       tty - covering cursor movement/backspace editing a command before
+       it runs, arrow-key history recall, `^A`/`^K` line-clearing, and
+       `Ctrl-C` aborting a line without killing the shell; `fc`/
+       `history`/HISTFILE-persistence-across-sessions are covered via the
+       existing pipe-based `InteractiveSession` (they don't need a real
+       terminal - see item 8), and `History` itself has a direct Catch2
+       unit-test file (`tests/runtime/test_history.cpp`) for its
+       numbering/dedup/trim/load-save behavior in isolation. See the
+       hard-corners note on why every one of these helpers sets
+       `HISTFILE=/dev/null` (or a throwaway temp path) rather than
+       leaving it unset.
 
 Items 1-9 above are all now at least minimally done; "broad POSIX from
 the start" meant the *architecture* supported the full grammar/expansion/
 execution model from day one, and it has - what's left is breadth within
-each piece (more built-ins, interactive line editing/history) rather
-than architectural gaps.
+each piece (a couple of niche built-ins, completion, a real vi editing
+mode) rather than architectural gaps.

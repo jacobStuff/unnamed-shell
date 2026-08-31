@@ -19,12 +19,15 @@
 
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "ast/ast.hpp"
+#include "exec/control_signals.hpp"
 #include "exec/executor.hpp"
+#include "interactive/line_editor.hpp"
 #include "lexer/lexer.hpp"
 #include "parser/parser.hpp"
 #include "runtime/environment.hpp"
@@ -53,6 +56,29 @@ std::string expandPrompt(ush::Executor& executor, ush::Environment& env, const c
     } catch (...) {
         return raw;
     }
+}
+
+// $HISTFILE, or ~/.ush_history if unset - std::nullopt (no persistence
+// this session) if neither HISTFILE nor HOME is available.
+std::optional<std::string> historyFilePath(ush::Environment& env) {
+    if (auto f = env.get("HISTFILE")) return f;
+    if (auto home = env.get("HOME")) return *home + "/.ush_history";
+    return std::nullopt;
+}
+
+// $HISTSIZE, defaulting to 500 if unset or not a valid non-negative
+// integer (a negative or garbage HISTSIZE just falls back rather than
+// wedging history entirely).
+std::size_t historySizeFromEnv(ush::Environment& env) {
+    auto raw = env.get("HISTSIZE");
+    if (!raw) return 500;
+    try {
+        std::size_t consumed = 0;
+        long n = std::stol(*raw, &consumed);
+        if (consumed == raw->size() && n >= 0) return static_cast<std::size_t>(n);
+    } catch (...) {
+    }
+    return 500;
 }
 
 // Runs ush interactively: prompt, read a line, accumulate lines until a
@@ -90,6 +116,26 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
     // themselves.
     std::vector<ush::ast::List> programs;
 
+    // Command history (fc, HISTFILE/HISTSIZE) lives on the executor (see
+    // Executor::history()) so the `fc`/`history` built-ins can reach it
+    // too. Recording happens here regardless of whether the fancy raw-
+    // mode editor below is actually in use - a real shell still keeps
+    // history when run interactively with piped/redirected stdin (e.g.
+    // `ush -i < script`, or every integration test that drives `ush -i`
+    // this way), it just can't offer arrow-key recall for it without a
+    // real terminal.
+    std::optional<std::string> histFile = historyFilePath(env);
+    executor.history().setMaxSize(historySizeFromEnv(env));
+    if (histFile) executor.history().load(*histFile);
+
+    // The raw-mode line editor (cursor movement, in-place editing,
+    // arrow-key history recall) only makes sense - and only works at all,
+    // termios-wise - on an actual terminal. Otherwise every read below
+    // falls back to plain std::getline, exactly the previous behavior.
+    bool useEditor = ush::LineEditor::isUsable();
+    std::optional<ush::LineEditor> editor;
+    if (useEditor) editor.emplace(executor);
+
     std::string buffer;
     bool continuing = false;
     int status = 0;
@@ -98,66 +144,95 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
     // directly, so the EXIT trap (if any) always gets to run exactly once,
     // right before the session actually ends - see
     // Executor::runExitTrapIfSet().
-    while (true) {
-        // Background/stopped job state changes are reported here, right
-        // before the next prompt - not asynchronously as they happen -
-        // matching real shells' default behavior.
-        if (!continuing) executor.updateAndNotifyJobs();
+    try {
+        while (true) {
+            // Background/stopped job state changes are reported here,
+            // right before the next prompt - not asynchronously as they
+            // happen - matching real shells' default behavior.
+            if (!continuing) executor.updateAndNotifyJobs();
 
-        std::string prompt =
-            continuing ? expandPrompt(executor, env, "PS2", "> ")
-                       : expandPrompt(executor, env, "PS1", ::geteuid() == 0 ? "# " : "$ ");
-        std::fputs(prompt.c_str(), stdout);
-        std::fflush(stdout);
+            std::string prompt =
+                continuing ? expandPrompt(executor, env, "PS2", "> ")
+                           : expandPrompt(executor, env, "PS1", ::geteuid() == 0 ? "# " : "$ ");
 
-        std::string line;
-        if (!std::getline(std::cin, line)) {
-            std::fputc('\n', stdout);
-            if (!buffer.empty()) {
-                std::cerr << "ush: syntax error: unexpected end of file\n";
-                status = 2;
+            std::string line;
+            if (useEditor) {
+                auto result = editor->readLine(prompt, line);
+                if (result == ush::LineEditor::Result::Interrupted) {
+                    // Ctrl-C: discard whatever multi-line command was
+                    // being accumulated and start fresh, like real shells.
+                    buffer.clear();
+                    continuing = false;
+                    continue;
+                }
+                if (result == ush::LineEditor::Result::Eof) {
+                    if (!buffer.empty()) {
+                        std::cerr << "ush: syntax error: unexpected end of file\n";
+                        status = 2;
+                    } else {
+                        status = env.lastExitStatus;
+                    }
+                    break;
+                }
             } else {
-                status = env.lastExitStatus;
+                std::fputs(prompt.c_str(), stdout);
+                std::fflush(stdout);
+                if (!std::getline(std::cin, line)) {
+                    std::fputc('\n', stdout);
+                    if (!buffer.empty()) {
+                        std::cerr << "ush: syntax error: unexpected end of file\n";
+                        status = 2;
+                    } else {
+                        status = env.lastExitStatus;
+                    }
+                    break;
+                }
             }
-            break;
-        }
-        buffer += line;
-        buffer += '\n';
+            buffer += line;
+            buffer += '\n';
 
-        ush::ast::List program;
-        try {
-            ush::Parser parser(buffer);
-            program = parser.parseProgram();
-        } catch (const ush::LexError& e) {
-            if (e.incomplete()) {
-                continuing = true;
+            ush::ast::List program;
+            try {
+                ush::Parser parser(buffer);
+                program = parser.parseProgram();
+            } catch (const ush::LexError& e) {
+                if (e.incomplete()) {
+                    continuing = true;
+                    continue;
+                }
+                std::cerr << "ush: syntax error: " << e.what() << '\n';
+                buffer.clear();
+                continuing = false;
+                continue;
+            } catch (const ush::ParseError& e) {
+                if (e.incomplete()) {
+                    continuing = true;
+                    continue;
+                }
+                std::cerr << "ush: syntax error: " << e.what() << '\n';
+                buffer.clear();
+                continuing = false;
                 continue;
             }
-            std::cerr << "ush: syntax error: " << e.what() << '\n';
+
+            executor.history().add(buffer);
             buffer.clear();
             continuing = false;
-            continue;
-        } catch (const ush::ParseError& e) {
-            if (e.incomplete()) {
-                continuing = true;
-                continue;
+
+            programs.push_back(std::move(program));
+            auto outcome = executor.runProgramCatchingExit(programs.back());
+            if (outcome.exitRequested) {
+                status = outcome.status;
+                break;
             }
-            std::cerr << "ush: syntax error: " << e.what() << '\n';
-            buffer.clear();
-            continuing = false;
-            continue;
         }
-
-        buffer.clear();
-        continuing = false;
-
-        programs.push_back(std::move(program));
-        auto outcome = executor.runProgramCatchingExit(programs.back());
-        if (outcome.exitRequested) {
-            status = outcome.status;
-            break;
-        }
+    } catch (const ush::ExitSignal& e) {
+        // An INT (or other trapped-signal) handler run from inside the
+        // line editor itself (sitting at the prompt, no foreground child
+        // to attribute it to - see LineEditor::readByte()) called `exit`.
+        status = e.status & 0xFF;
     }
+    if (histFile) executor.history().save(*histFile);
     return executor.runExitTrapIfSet(status);
 }
 
