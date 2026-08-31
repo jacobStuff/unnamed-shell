@@ -721,7 +721,10 @@ int biWait(Executor&, const std::vector<std::string>& args) {
         while (true) {
             int wstatus = 0;
             pid_t r = ::waitpid(-1, &wstatus, 0);
-            if (r < 0) break;  // ECHILD: no more children
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                break;  // ECHILD: no more children
+            }
             status = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 128 + WTERMSIG(wstatus);
         }
         return status;
@@ -732,7 +735,10 @@ int biWait(Executor&, const std::vector<std::string>& args) {
         return 2;
     }
     int wstatus = 0;
-    if (::waitpid(pid, &wstatus, 0) < 0) {
+    pid_t r;
+    while ((r = ::waitpid(pid, &wstatus, 0)) < 0 && errno == EINTR) {
+    }
+    if (r < 0) {
         std::fprintf(stderr, "ush: wait: %s: %s\n", args[1].c_str(), std::strerror(errno));
         return 127;
     }

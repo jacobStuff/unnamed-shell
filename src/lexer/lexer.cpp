@@ -32,7 +32,11 @@ char Lexer::advanceChar() {
 void Lexer::error(std::string message) const { errorAt(std::move(message), here()); }
 
 void Lexer::errorAt(std::string message, SourceLoc loc) const {
-    throw LexError(std::move(message), loc);
+    // Every "unterminated ..." error site checks atEnd() immediately
+    // before calling errorAt(), so atEnd() being true here reliably means
+    // this error IS one of those (as opposed to some other lexical
+    // problem found mid-input) - see LexError::incomplete().
+    throw LexError(std::move(message), loc, /*incomplete=*/atEnd());
 }
 
 // ---------------------------------------------------------------------

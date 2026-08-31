@@ -43,6 +43,17 @@ public:
     // instead of letting them propagate further.
     int runProgram(const ast::List& program);
 
+    struct ProgramOutcome {
+        int status;
+        // True if `exit` was invoked while running this program. A
+        // non-interactive run (runProgram) doesn't need to distinguish
+        // this - it's about to terminate the process either way - but an
+        // interactive REPL runs one program per input line and needs to
+        // know whether to stop looping.
+        bool exitRequested;
+    };
+    ProgramOutcome runProgramCatchingExit(const ast::List& program);
+
     // CommandRunner: runs `source` as a full program in a forked child
     // with stdout redirected to a pipe, and returns the captured output
     // (§2.6.3 - the caller, Expander, strips trailing newlines).

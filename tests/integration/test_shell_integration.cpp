@@ -28,8 +28,7 @@ struct RunResult {
     int status;
 };
 
-RunResult runUsh(const std::string& script, const std::vector<std::string>& extraArgs = {},
-                  const std::string& stdinContent = "") {
+RunResult runUshWithArgv(const std::vector<std::string>& args, const std::string& stdinContent) {
     int outPipe[2];
     REQUIRE(::pipe(outPipe) == 0);
     int inPipe[2];
@@ -47,8 +46,6 @@ RunResult runUsh(const std::string& script, const std::vector<std::string>& extr
         ::close(outPipe[0]);
         ::close(outPipe[1]);
 
-        std::vector<std::string> args = {USH_BINARY_PATH, "-c", script};
-        for (const auto& a : extraArgs) args.push_back(a);
         std::vector<char*> argv;
         for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
         argv.push_back(nullptr);
@@ -76,6 +73,23 @@ RunResult runUsh(const std::string& script, const std::vector<std::string>& extr
     ::waitpid(pid, &wstatus, 0);
     int status = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : (128 + WTERMSIG(wstatus));
     return {output, status};
+}
+
+RunResult runUsh(const std::string& script, const std::vector<std::string>& extraArgs = {},
+                  const std::string& stdinContent = "") {
+    std::vector<std::string> args = {USH_BINARY_PATH, "-c", script};
+    for (const auto& a : extraArgs) args.push_back(a);
+    return runUshWithArgv(args, stdinContent);
+}
+
+// Runs ush in forced-interactive mode (`-i` - see main.cpp; a real tty
+// isn't available/needed here, since only the parse-incrementally-and-
+// prompt logic is under test, not terminal line editing) with
+// `stdinScript` fed to it a line at a time, and returns the combined
+// output (prompts interleaved with whatever the commands themselves
+// print) and exit status.
+RunResult runUshInteractive(const std::string& stdinScript) {
+    return runUshWithArgv({USH_BINARY_PATH, "-i"}, stdinScript);
 }
 
 class TempDir {
@@ -341,4 +355,71 @@ TEST_CASE("umask reports and sets the current mask", "[integration]") {
 TEST_CASE("wait reaps a background job and returns its exit status", "[integration]") {
     auto r = runUsh("(exit 7) & wait; echo \"status=$?\"");
     CHECK(r.output == "status=7\n");
+}
+
+// --- interactive mode (-i) ----------------------------------------------
+
+TEST_CASE("interactive mode prompts with PS1 and runs each complete line", "[integration]") {
+    auto r = runUshInteractive("echo hello\necho world\n");
+    CHECK(r.output == "$ hello\n$ world\n$ \n");
+    CHECK(r.status == 0);
+}
+
+TEST_CASE("an incomplete compound command continues with PS2 until it closes",
+          "[integration]") {
+    auto r = runUshInteractive("if true\nthen\necho yes\nfi\n");
+    CHECK(r.output == "$ > > > yes\n$ \n");
+}
+
+TEST_CASE("an unterminated quote continues with PS2, preserving the embedded newline",
+          "[integration]") {
+    auto r = runUshInteractive("echo \"a\nb\"\n");
+    CHECK(r.output == "$ > a\nb\n$ \n");
+}
+
+TEST_CASE("a function defined on one line is callable on a later one", "[integration]") {
+    auto r = runUshInteractive("greet() { echo \"hi $1\"; }\ngreet world\n");
+    CHECK(r.output == "$ $ hi world\n$ \n");
+}
+
+TEST_CASE("exit ends the interactive session immediately, skipping later lines",
+          "[integration]") {
+    auto r = runUshInteractive("echo before\nexit 5\necho after\n");
+    CHECK(r.output == "$ before\n$ ");
+    CHECK(r.status == 5);
+}
+
+TEST_CASE("a genuine syntax error is reported and the session recovers", "[integration]") {
+    auto r = runUshInteractive("echo hi &&\n&& echo bad\necho recovered\n");
+    CHECK(r.output.find("hi") == std::string::npos);  // the first line never completed/ran
+    CHECK(r.output.find("syntax error") != std::string::npos);
+    CHECK(r.output.find("recovered\n") != std::string::npos);
+}
+
+TEST_CASE("unexpected end of file inside an unfinished command is an error, exit status 2",
+          "[integration]") {
+    auto r = runUshInteractive("if true\nthen\necho yes\n");
+    CHECK(r.output.find("syntax error") != std::string::npos);
+    CHECK(r.status == 2);
+}
+
+TEST_CASE("a plain end of file at a fresh prompt exits cleanly with status 0",
+          "[integration]") {
+    auto r = runUshInteractive("");
+    CHECK(r.output == "$ \n");
+    CHECK(r.status == 0);
+}
+
+TEST_CASE("setting PS1 takes effect starting with the next prompt", "[integration]") {
+    auto r = runUshInteractive("PS1='myprompt> '\necho after\n");
+    // Trailing "\n" is the cosmetic newline printed on EOF at a fresh
+    // prompt (real shells do the same on Ctrl-D, since EOF doesn't echo
+    // one itself).
+    CHECK(r.output == "$ myprompt> after\nmyprompt> \n");
+}
+
+TEST_CASE("-i combined with -c just runs non-interactively (documented simplification)",
+          "[integration]") {
+    auto r = runUshWithArgv({USH_BINARY_PATH, "-i", "-c", "echo hi"}, "");
+    CHECK(r.output == "hi\n");
 }

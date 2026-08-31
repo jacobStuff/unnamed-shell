@@ -21,13 +21,22 @@ namespace ush {
 // substitutions, etc.
 class LexError : public std::runtime_error {
 public:
-    LexError(std::string message, SourceLoc loc)
-        : std::runtime_error(std::move(message)), loc_(loc) {}
+    LexError(std::string message, SourceLoc loc, bool incomplete = false)
+        : std::runtime_error(std::move(message)), loc_(loc), incomplete_(incomplete) {}
 
     const SourceLoc& location() const { return loc_; }
 
+    // True for every "unterminated ..." error (unclosed quote/
+    // substitution/here-document): these all fire exactly when the
+    // scanner runs out of input mid-construct, which is exactly the
+    // condition an interactive REPL should treat as "not wrong, just
+    // needs another line" (prompt with PS2) rather than a genuine syntax
+    // error to report immediately. See Lexer::errorAt().
+    bool incomplete() const { return incomplete_; }
+
 private:
     SourceLoc loc_;
+    bool incomplete_;
 };
 
 class Lexer {

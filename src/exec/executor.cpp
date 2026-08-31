@@ -1,6 +1,7 @@
 #include "exec/executor.hpp"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -36,6 +37,30 @@ int statusFromWait(int wstatus) {
 }
 
 [[noreturn]] void exitChild(int status) { std::exit(status & 0xFF); }
+
+// waitpid(2), retrying on EINTR. Needed once the shell can have a signal
+// handler installed at all (interactive mode ignores SIGINT/SIGQUIT so
+// Ctrl-C/Ctrl-\ at the prompt don't kill the shell - see main.cpp) -
+// without retrying, a blocked wait interrupted by a delivered-but-ignored
+// signal would return early with `wstatus` never actually filled in by
+// the child's real exit, misreporting its status.
+pid_t waitpidRetry(pid_t pid, int* status, int options) {
+    pid_t r;
+    while ((r = ::waitpid(pid, status, options)) < 0 && errno == EINTR) {
+    }
+    return r;
+}
+
+// A foreground child (external program, pipeline stage, or subshell)
+// should be interruptible by Ctrl-C/Ctrl-\ even when the shell itself
+// ignores them (see main.cpp's interactive setup) - reset to the default
+// disposition right after fork(), before running anything else. Not used
+// for the async ("&") fork: a background job inheriting the shell's
+// ignored disposition (when interactive) is what real shells do too.
+void resetForegroundSignalsInChild() {
+    ::signal(SIGINT, SIG_DFL);
+    ::signal(SIGQUIT, SIG_DFL);
+}
 
 // fork(2) duplicates the whole process, including any output sitting
 // unflushed in libc's stdio buffers (e.g. from a builtin's printf/fputs).
@@ -104,33 +129,35 @@ private:
 
 Executor::Executor(Environment& env) : env_(env), expander_(env, this) {}
 
-int Executor::runProgram(const ast::List& program) {
+Executor::ProgramOutcome Executor::runProgramCatchingExit(const ast::List& program) {
     try {
-        return runList(program);
+        return {runList(program), false};
     } catch (const ExitSignal& e) {
-        return e.status & 0xFF;
+        return {e.status & 0xFF, true};
     } catch (const ReturnSignal& r) {
         // `return` outside any function/dot-script: treat like exit, a
         // reasonable simplification (POSIX leaves this unspecified).
-        return r.status & 0xFF;
+        return {r.status & 0xFF, false};
     } catch (const BreakSignal&) {
-        return 0;  // break/continue outside any loop: ignored
+        return {0, false};  // break/continue outside any loop: ignored
     } catch (const ContinueSignal&) {
-        return 0;
+        return {0, false};
     } catch (const ExpansionError& e) {
         std::fprintf(stderr, "ush: %s\n", e.what());
-        return 1;
+        return {1, false};
     } catch (const ArithError& e) {
         std::fprintf(stderr, "ush: %s\n", e.what());
-        return 1;
+        return {1, false};
     } catch (const LexError& e) {
         std::fprintf(stderr, "ush: syntax error: %s\n", e.what());
-        return 2;
+        return {2, false};
     } catch (const ParseError& e) {
         std::fprintf(stderr, "ush: syntax error: %s\n", e.what());
-        return 2;
+        return {2, false};
     }
 }
+
+int Executor::runProgram(const ast::List& program) { return runProgramCatchingExit(program).status; }
 
 int Executor::runSourceInCurrentContext(const std::string& source) {
     ast::List program;
@@ -162,6 +189,7 @@ std::string Executor::runAndCaptureStdout(const std::string& source) {
         return "";
     }
     if (pid == 0) {
+        resetForegroundSignalsInChild();
         ::close(pipefd[0]);
         ::dup2(pipefd[1], 1);
         ::close(pipefd[1]);
@@ -187,7 +215,7 @@ std::string Executor::runAndCaptureStdout(const std::string& source) {
     ::close(pipefd[0]);
 
     int wstatus = 0;
-    ::waitpid(pid, &wstatus, 0);
+    waitpidRetry(pid, &wstatus, 0);
     env_.lastExitStatus = statusFromWait(wstatus);
     return output;
 }
@@ -253,6 +281,7 @@ int Executor::runPipeline(const ast::Pipeline& pipeline) {
             flushStdioBeforeFork();
             pid_t pid = ::fork();
             if (pid == 0) {
+                resetForegroundSignalsInChild();
                 if (i > 0) ::dup2(pipes[i - 1][0], 0);
                 if (i + 1 < n) ::dup2(pipes[i][1], 1);
                 for (auto& p : pipes) {
@@ -276,7 +305,7 @@ int Executor::runPipeline(const ast::Pipeline& pipeline) {
         int lastStatus = 1;
         for (std::size_t i = 0; i < n; ++i) {
             int wstatus = 0;
-            ::waitpid(pids[i], &wstatus, 0);
+            waitpidRetry(pids[i], &wstatus, 0);
             if (i + 1 == n) lastStatus = statusFromWait(wstatus);
         }
         status = lastStatus;
@@ -439,6 +468,7 @@ int Executor::execExternal(const std::string& name, const std::vector<std::strin
         return 1;
     }
     if (pid == 0) {
+        resetForegroundSignalsInChild();
         if (!applyRedirects(redirects, nullptr)) exitChild(1);
 
         std::vector<std::string> envStrings = env_.exportedEnviron();
@@ -478,7 +508,7 @@ int Executor::execExternal(const std::string& name, const std::vector<std::strin
     }
 
     int wstatus = 0;
-    ::waitpid(pid, &wstatus, 0);
+    waitpidRetry(pid, &wstatus, 0);
     return statusFromWait(wstatus);
 }
 
@@ -571,6 +601,7 @@ int Executor::runSubshell(const ast::Subshell& sh) {
         return 1;
     }
     if (pid == 0) {
+        resetForegroundSignalsInChild();
         int status = 1;
         try {
             status = runList(sh.body);
@@ -580,7 +611,7 @@ int Executor::runSubshell(const ast::Subshell& sh) {
         exitChild(status);
     }
     int wstatus = 0;
-    ::waitpid(pid, &wstatus, 0);
+    waitpidRetry(pid, &wstatus, 0);
     return statusFromWait(wstatus);
 }
 

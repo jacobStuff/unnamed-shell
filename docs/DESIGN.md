@@ -211,6 +211,43 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   a script through the executor). Strict POSIX says a variable-assignment
   error should exit a non-interactive shell entirely; ush's softer
   behavior is a documented simplification.
+- **Distinguishing "needs more input" from "syntax error"** for the
+  interactive REPL's `PS2` continuation turned out to have a single,
+  minimally-invasive fix rather than needing every error site touched
+  individually: every `Lexer` "unterminated ..." error already checks
+  `atEnd()` immediately before throwing, and every `Parser` grammar-
+  expectation failure already goes through one `error()` method that
+  looks at `current_` right after failing to match something against it.
+  So `Lexer::errorAt()` just records `atEnd()` as `LexError::incomplete()`,
+  and `Parser::error()` just records `current_.type == EndOfInput` as
+  `ParseError::incomplete()` - both computed once, at the single existing
+  throw site, rather than threaded through every individual call site.
+  This also means unterminated here-documents surface as "incomplete"
+  for free (an unfound heredoc delimiter is exactly an `atEnd()`-triggered
+  `LexError`), with no heredoc-specific code in the REPL at all.
+- **Keeping function definitions alive across an interactive session**
+  without cloning the AST: `runInteractive()` pushes each successfully-
+  parsed `ast::List` onto a `std::vector` that lives for the whole
+  session, and `Executor::functions_` keeps raw pointers into whichever
+  `ast::List` a function was defined in (see `executor.hpp`'s lifetime
+  note). Appending to that vector - even when it reallocates - never
+  invalidates those pointers, because they point at `Command` objects
+  reached through `ast::Pipeline::commands` (a
+  `vector<unique_ptr<Command>>`): reallocating the *outer* vector moves
+  `unique_ptr`s around, not the heap-allocated `Command` objects they own.
+  A single-shot run (`-c`/script/piped stdin) doesn't need any of this -
+  it parses once into one `ast::List` that simply outlives the one
+  `runProgram()` call.
+- **Ctrl-C/Ctrl-\\ in interactive mode** (ignored by the shell itself,
+  reset to default in every forked foreground child - see
+  `resetForegroundSignalsInChild()` in `executor.cpp`) was verified
+  manually rather than with an automated test: sending `SIGINT` directly
+  to a running interactive `ush` leaves it alive and responsive, and
+  sending it to a foreground child (e.g. a `sleep`) kills that child
+  promptly while the shell continues - both confirmed by hand. Automating
+  this reliably would mean asserting on real process-group signal
+  delivery and timing, which is a more likely source of flaky CI than of
+  genuine regression coverage, so it's deliberately not in the suite.
 
 ## Status / roadmap
 
@@ -325,18 +362,45 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        reaps *all* children with no argument, since there's no job
        table yet - see item 8), `umask`. **Not implemented**: `hash`,
        `kill`, `alias`/`unalias`.
-8. [ ] Interactive mode: prompt expansion (`PS1`/`PS2`), basic line editing,
-       history. Job control (`bg`/`fg`/`jobs`, `SIGTSTP` handling) - XSI,
-       may land after everything above is solid. `main.cpp` currently
-       supports `ush -c 'cmd' [name [arg...]]`, `ush script [arg...]`,
-       and whole-script-from-stdin - real non-interactive use, just not
-       an interactive REPL yet.
+8. [~] Interactive mode (`src/main.cpp`'s `runInteractive`): a real REPL -
+       prompts with `PS1`/`PS2` (expanded the same as any other word:
+       tilde/parameter/command/arithmetic + quote removal), reads and
+       parses incrementally so a `PS2` continuation prompt appears for
+       any unfinished construct (unclosed quote, compound command,
+       here-document, trailing `&&`/`|`/...), and recovers cleanly from
+       a genuine syntax error (reports it, discards the bad input,
+       keeps going) versus an incomplete one (keeps reading). Every
+       parsed program is kept alive for the session, so a function
+       defined on one line is callable on a later one - see the
+       "Known hard corners" note on `LexError`/`ParseError::incomplete()`
+       and on session-lifetime AST ownership. `Ctrl-C`/`Ctrl-\` no
+       longer kill the shell itself in interactive mode (ignored there,
+       reset to default in every forked foreground child - external
+       programs, pipeline stages, subshells, command substitution -
+       so they're still interruptible; a background `&` job keeps the
+       inherited ignore, matching real shells) - manually verified (see
+       the hard-corners note) rather than covered by an automated test,
+       since reliably automating signal/process-group timing tends to
+       be a source of test flakiness rather than of confidence.
+       **Not implemented**: line editing beyond what the terminal's own
+       canonical mode provides for free (backspace, `^U`, `^W` - but no
+       arrow-key cursor movement or history recall), a real history
+       list, and job control (`bg`/`fg`/`jobs`, `SIGTSTP` handling,
+       XSI) - `main.cpp` also supports `ush -c 'cmd' [name [arg...]]`
+       and `ush script [arg...]` for non-interactive use, and `ush -i`
+       to force interactive mode without a real terminal (used by the
+       integration tests, and a real, if minor, usability feature in
+       its own right - matches other shells' `-i`).
 9. [x] Integration test suite (`tests/integration/`) - runs the actual
        built `ush` binary (via `fork`+`execve`, not `popen`, to avoid a
        second layer of shell quoting) against real scripts and checks
        combined stdout/stderr and exit status. This is what caught both
        bugs mentioned in item 5 - process-level behavior that unit tests
-       mocking nothing couldn't have exercised.
+       mocking nothing couldn't have exercised. Also covers interactive
+       mode end to end (via `-i`, see item 8): PS1/PS2 prompts appearing
+       exactly where expected, multi-line continuation, function
+       persistence across lines, `exit` ending the session immediately,
+       and syntax-error recovery.
 
 Items 1-9 above are all now at least minimally done; "broad POSIX from
 the start" meant the *architecture* supported the full grammar/expansion/

@@ -23,34 +23,42 @@ To build without tests: `cmake -S . -B build -DUSH_BUILD_TESTS=OFF`.
 
 ## Running
 
-`ush` runs non-interactively so far - no prompt/line-editing REPL yet
-(see the roadmap):
-
 ```bash
+./build/src/ush                               # interactive, if stdin is a terminal
 ./build/src/ush -c 'echo hello $((2+2))'      # run a command string
 ./build/src/ush script.sh arg1 arg2           # run a script file
-echo 'echo hi' | ./build/src/ush              # run a script from stdin
+echo 'echo hi' | ./build/src/ush              # run a script from stdin (non-interactive)
+./build/src/ush -i                            # force interactive mode even without a terminal
 ```
+
+Interactive mode has a real prompt (`PS1`/`PS2`, both expanded like any
+other word) and multi-line continuation for anything left unfinished
+(an open quote, an `if` without its `fi` yet, a trailing `&&`, ...), but
+no arrow-key history/cursor movement beyond what the terminal's own
+canonical line mode provides for free (backspace, `^U`, `^W`) - see the
+roadmap.
 
 ## Status
 
-The core pipeline is end to end and can run real scripts: the lexer
-(§2.2/§2.3), the parser (§2.10.2 grammar → AST, including here-documents),
-the shell variable/parameter environment (§2.5), all of word expansion
-(§2.6 - tilde, the full `${...}` parameter expansion grammar, command
-substitution, arithmetic expansion, field splitting, pathname expansion,
-quote removal), and the executor (§2.9/§2.7 -
-fork/exec/pipelines/redirection/all compound commands/functions). Built-
-ins: every POSIX special built-in except `trap`/`times`, plus a practical
-regular set - `cd`, `pwd`, `echo`, `printf`, `read`, `test`/`[`, `true`,
-`false`, `command`, `type`, `getopts`, `wait`, `umask`. Done and tested:
-823 assertions across 161 cases, including integration tests that run the
-actual built binary end to end.
+The core pipeline is end to end and can run real scripts, interactively
+or not: the lexer (§2.2/§2.3), the parser (§2.10.2 grammar → AST,
+including here-documents), the shell variable/parameter environment
+(§2.5), all of word expansion (§2.6 - tilde, the full `${...}` parameter
+expansion grammar, command substitution, arithmetic expansion, field
+splitting, pathname expansion, quote removal), the executor (§2.9/§2.7 -
+fork/exec/pipelines/redirection/all compound commands/functions), and a
+real interactive REPL (prompts, multi-line continuation, `Ctrl-C` no
+longer killing the shell). Built-ins: every POSIX special built-in except
+`trap`/`times`, plus a practical regular set - `cd`, `pwd`, `echo`,
+`printf`, `read`, `test`/`[`, `true`, `false`, `command`, `type`,
+`getopts`, `wait`, `umask`. Done and tested: 869 assertions across 171
+cases, including integration tests that run the actual built binary end
+to end (interactively too, via `-i`).
 
 Still to come: `trap`/real signal handling, job control (`jobs`/`bg`/`fg`
 - `wait` exists but is best-effort with no job table yet), a few more
-niche built-ins (`kill`, `hash`, `alias`), and interactive mode (a
-prompt, line editing, history). See the roadmap in
+niche built-ins (`kill`, `hash`, `alias`), and real line editing/history
+(arrow-key recall, cursor movement). See the roadmap in
 [docs/DESIGN.md](docs/DESIGN.md#status--roadmap).
 
 ## License

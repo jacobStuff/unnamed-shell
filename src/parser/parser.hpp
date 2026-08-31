@@ -32,13 +32,22 @@ namespace ush {
 
 class ParseError : public std::runtime_error {
 public:
-    ParseError(std::string message, SourceLoc loc)
-        : std::runtime_error(std::move(message)), loc_(loc) {}
+    ParseError(std::string message, SourceLoc loc, bool incomplete = false)
+        : std::runtime_error(std::move(message)), loc_(loc), incomplete_(incomplete) {}
 
     const SourceLoc& location() const { return loc_; }
 
+    // True when this error fired because the token stream ran out
+    // (EndOfInput) at a point where the grammar expected more - i.e. the
+    // input so far is a valid prefix of a complete command, just not one
+    // yet. An interactive REPL should treat this as "read another line"
+    // (PS2) rather than a syntax error to report immediately. See
+    // Parser::error().
+    bool incomplete() const { return incomplete_; }
+
 private:
     SourceLoc loc_;
+    bool incomplete_;
 };
 
 class Parser {

@@ -581,7 +581,12 @@ ast::List Parser::parseProgram() {
 }
 
 void Parser::error(const std::string& message) const {
-    throw ParseError(message, current_.loc);
+    // Every grammar-expectation failure looks at current_ right after
+    // trying (and failing) to match something against it; if current_ is
+    // EndOfInput, the input so far was a valid prefix of a complete
+    // command that simply hasn't finished yet - see
+    // ParseError::incomplete().
+    throw ParseError(message, current_.loc, /*incomplete=*/current_.type == TokenType::EndOfInput);
 }
 
 }  // namespace ush
