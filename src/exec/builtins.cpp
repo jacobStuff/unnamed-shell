@@ -41,6 +41,25 @@ int parseIntArg(const std::string& s, int fallback) {
     }
 }
 
+// Resolves a `fg`/`bg`/`wait` job operand: "%n" for job n, "%%"/"%+"/"%-"
+// (ush doesn't distinguish "current" from "previous", unlike real shells
+// with fuller job-control fidelity) or a bare empty string for the
+// current (most-recently-referenced) job. Returns nullptr if it doesn't
+// look like a job spec at all, or names a job that doesn't exist.
+Executor::Job* resolveJobSpec(Executor& ex, const std::string& spec) {
+    if (spec.empty()) return ex.currentJob();
+    if (spec[0] != '%') return nullptr;
+    std::string rest = spec.substr(1);
+    if (rest.empty() || rest == "%" || rest == "+" || rest == "-") return ex.currentJob();
+    try {
+        std::size_t consumed = 0;
+        int id = std::stoi(rest, &consumed);
+        if (consumed == rest.size()) return ex.findJob(id);
+    } catch (...) {
+    }
+    return nullptr;
+}
+
 // Shared by `trap` and `kill`. Covers the signals standardized by POSIX
 // and available under the same name on both macOS and Linux.
 struct SignalSpec {
@@ -848,7 +867,7 @@ int biGetopts(Executor& ex, const std::vector<std::string>& args) {
 // otherwise); with a pid, waits for exactly that one and reports its
 // exit status. Best-effort, since ush doesn't track a job list - a
 // documented simplification (see docs/DESIGN.md).
-int biWait(Executor&, const std::vector<std::string>& args) {
+int biWait(Executor& ex, const std::vector<std::string>& args) {
     if (args.size() < 2) {
         int status = 0;
         while (true) {
@@ -862,6 +881,30 @@ int biWait(Executor&, const std::vector<std::string>& args) {
         }
         return status;
     }
+    if (!args[1].empty() && args[1][0] == '%') {
+        Executor::Job* job = resolveJobSpec(ex, args[1]);
+        if (!job) {
+            std::fprintf(stderr, "ush: wait: %s: no such job\n", args[1].c_str());
+            return 127;
+        }
+        int id = job->id;
+        std::vector<pid_t> pids = job->pids;  // copy: this loop reaps directly, bypassing the
+                                               // job table's own bookkeeping (see removeJob())
+        int status = 0;
+        for (pid_t p : pids) {
+            int wstatus = 0;
+            pid_t r;
+            while ((r = ::waitpid(p, &wstatus, 0)) < 0 && errno == EINTR) {
+            }
+            if (r == p) status = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 128 + WTERMSIG(wstatus);
+        }
+        // Reaped directly above, so there's nothing left for
+        // updateAndNotifyJobs()'s own waitpid(2) calls to see - erase the
+        // entry directly instead, or it would look stuck forever.
+        ex.removeJob(id);
+        return status;
+    }
+
     pid_t pid = static_cast<pid_t>(parseIntArg(args[1], -1));
     if (pid < 0) {
         std::fprintf(stderr, "ush: wait: %s: not a pid\n", args[1].c_str());
@@ -898,9 +941,10 @@ int biUmask(Executor&, const std::vector<std::string>& args) {
 }
 
 // `kill [-signal] pid...` / `kill -l`: sends a signal (default TERM) to
-// each pid, or lists known signal names. No job-control `%job` operand
-// support (ush has no job table yet - see docs/DESIGN.md).
-int biKill(Executor&, const std::vector<std::string>& args) {
+// each pid (or, given a "%n" operand, to that job's whole process group -
+// only meaningful when job control is active), or lists known signal
+// names.
+int biKill(Executor& ex, const std::vector<std::string>& args) {
     std::size_t i = 1;
     if (i < args.size() && args[i] == "-l") {
         for (const auto& spec : kSignalTable) std::printf("%s ", spec.name);
@@ -925,23 +969,83 @@ int biKill(Executor&, const std::vector<std::string>& args) {
 
     int status = 0;
     for (; i < args.size(); ++i) {
-        std::size_t consumed = 0;
-        long pidVal = 0;
-        try {
-            pidVal = std::stol(args[i], &consumed);
-        } catch (...) {
+        pid_t target;
+        if (!args[i].empty() && args[i][0] == '%') {
+            Executor::Job* job = resolveJobSpec(ex, args[i]);
+            if (!job) {
+                std::fprintf(stderr, "ush: kill: %s: no such job\n", args[i].c_str());
+                status = 1;
+                continue;
+            }
+            target = -job->pgid;  // negative: signal the whole process group
+        } else {
+            std::size_t consumed = 0;
+            long pidVal = 0;
+            try {
+                pidVal = std::stol(args[i], &consumed);
+            } catch (...) {
+            }
+            if (consumed != args[i].size()) {
+                std::fprintf(stderr, "ush: kill: %s: arguments must be process IDs\n", args[i].c_str());
+                status = 1;
+                continue;
+            }
+            target = static_cast<pid_t>(pidVal);
         }
-        if (consumed != args[i].size()) {
-            std::fprintf(stderr, "ush: kill: %s: arguments must be process IDs\n", args[i].c_str());
-            status = 1;
-            continue;
-        }
-        if (::kill(static_cast<pid_t>(pidVal), signum) != 0) {
+        if (::kill(target, signum) != 0) {
             std::fprintf(stderr, "ush: kill: (%s): %s\n", args[i].c_str(), std::strerror(errno));
             status = 1;
         }
     }
     return status;
+}
+
+// `jobs [-l]`: lists background/stopped jobs. `-l` also shows each job's
+// process group id.
+int biJobs(Executor& ex, const std::vector<std::string>& args) {
+    ex.updateAndNotifyJobs();
+    bool longFormat = args.size() > 1 && args[1] == "-l";
+    for (const auto& job : ex.jobs()) {
+        const char* stateStr = job.state == Executor::Job::State::Running ? "Running" : "Stopped";
+        if (longFormat) {
+            std::printf("[%d]  %d  %-8s%s\n", job.id, static_cast<int>(job.pgid), stateStr,
+                        job.command.c_str());
+        } else {
+            std::printf("[%d]+  %-8s%s\n", job.id, stateStr, job.command.c_str());
+        }
+    }
+    return 0;
+}
+
+// `fg [%job]`: resumes a stopped or backgrounded job (SIGCONT) in the
+// foreground, hands it the terminal, and waits for it.
+int biFg(Executor& ex, const std::vector<std::string>& args) {
+    if (!ex.jobControlActive()) {
+        std::fprintf(stderr, "ush: fg: no job control\n");
+        return 1;
+    }
+    ex.updateAndNotifyJobs();
+    Executor::Job* job = resolveJobSpec(ex, args.size() > 1 ? args[1] : std::string());
+    if (!job) {
+        std::fprintf(stderr, "ush: fg: %s: no such job\n", args.size() > 1 ? args[1].c_str() : "current");
+        return 1;
+    }
+    return ex.resumeJob(*job, /*foreground=*/true);
+}
+
+// `bg [%job]`: resumes a stopped job (SIGCONT) in the background.
+int biBg(Executor& ex, const std::vector<std::string>& args) {
+    if (!ex.jobControlActive()) {
+        std::fprintf(stderr, "ush: bg: no job control\n");
+        return 1;
+    }
+    ex.updateAndNotifyJobs();
+    Executor::Job* job = resolveJobSpec(ex, args.size() > 1 ? args[1] : std::string());
+    if (!job) {
+        std::fprintf(stderr, "ush: bg: %s: no such job\n", args.size() > 1 ? args[1].c_str() : "current");
+        return 1;
+    }
+    return ex.resumeJob(*job, /*foreground=*/false);
 }
 
 // --- registry -----------------------------------------------------------
@@ -971,6 +1075,7 @@ const std::unordered_map<std::string, BuiltinFunc>& builtinTable() {
         {"printf", biPrintf},   {"read", biRead},       {"command", biCommand},
         {"type", biType},       {"getopts", biGetopts}, {"wait", biWait},
         {"umask", biUmask},     {"kill", biKill},
+        {"jobs", biJobs},       {"fg", biFg},           {"bg", biBg},
     };
     return table;
 }

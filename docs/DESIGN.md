@@ -268,6 +268,53 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   than "it appears when it's supposed to". Fixed by installing trap
   handlers via `sigaction(2)` with `sa_flags = 0` (no `SA_RESTART`)
   instead - see `installSignalDisposition()` in `executor.cpp`.
+- **A stop signal getting lost inside the "double fork"** - the most
+  subtle bug job control surfaced. `runCommand()`'s pre-existing
+  "simplicity over efficiency" tradeoff (an external command or subshell
+  nested inside an already-forked pipeline stage/subshell/async job
+  forks *again*, rather than the single fork a hand-optimized shell
+  would use) means the process actually running the target program is
+  often a *grandchild* of the shell, not a direct child - and POSIX
+  `wait`/`waitpid` can only ever reap direct children. The intermediate
+  "wrapper" layer's own wait for its child was a plain, untracked wait
+  (no `WUNTRACED`), so when a real, group-wide `SIGTSTP` (Ctrl-Z) hit the
+  whole tree - the wrapper inherited the job's process group, same as
+  the grandchild - the *grandchild* would stop, but the wrapper (which
+  itself typically ignores `SIGTSTP`, inherited from the interactive
+  shell) would just sit blocked forever in its ordinary wait, never
+  telling the top-level shell (which can only see the wrapper, its
+  actual direct child) that anything had happened. Fixed by making
+  `Executor::waitForChild()` - the shared helper every non-job-control-
+  owning wait goes through - pass `WUNTRACED` and, on seeing its own
+  child stop, `raise(SIGSTOP)` on *itself*. `SIGSTOP` can't be blocked or
+  ignored, so this always takes effect immediately; a group-wide
+  `SIGCONT` (from `bg`/`fg`) then resumes every layer together, and the
+  wrapper's wait loop falls through to an ordinary wait again. This
+  makes every intermediate layer, however many there are, visibly mirror
+  a stop, so whichever ancestor *is* actually doing job-control
+  bookkeeping (via `waitForJob()`'s own `WUNTRACED` wait on its direct
+  child) sees it. Caught by an integration test - but only after fixing
+  a bug *in the test itself* first: it originally sent `SIGTSTP` to a
+  single pid rather than negating it to target the whole process group,
+  which is what a real terminal's Ctrl-Z actually does - a good example
+  of a test's own fidelity to the real mechanism mattering as much as
+  the assertions in it.
+- **`wait %job` must retire the job table entry itself, not rely on
+  `updateAndNotifyJobs()` to notice.** `wait %job`'s own `waitpid(2)`
+  calls (needed to get that specific job's exit status directly) already
+  consume the underlying wait-status events for its pids; a subsequent
+  call to `updateAndNotifyJobs()` (which does its *own* group-wide
+  `waitpid(2)` calls to detect changes) would then find nothing left to
+  reap and leave the job looking permanently stuck at whatever state it
+  was last seen in. `Executor::removeJob()` erases the entry directly
+  once `wait %job` has already reaped it, sidestepping the conflict.
+- **Job-table/notification command text is approximate, not a real
+  unparser.** `describeWord()`/`describeCommand()`/`describePipeline()`
+  in `executor.cpp` reconstruct enough of a job's source text for `jobs`/
+  "[n]+ Stopped ..." to be recognizable - a word that isn't a single
+  unquoted literal (any quoting or expansion) prints as `...`, and a
+  compound command prints as a generic `{ ... }`. Good enough to tell
+  jobs apart by eye; not intended to reproduce the exact source.
 
 ## Status / roadmap
 
@@ -369,12 +416,31 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        two real termination points (`main.cpp`, both the non-interactive
        path and the end of the interactive session) - not inside
        `runProgram()`, which interactive mode calls once per input line.
-       **Not implemented**: job control beyond a bare `$!` (`SIGTSTP`,
-       process groups, `bg`/`fg`/`jobs`). See the "known hard corners"
-       above for three real bugs the tests caught (fork+stdio buffer
-       duplication; `lstat` vs `stat` on symlinked directories; `signal`
-       vs `sigaction`/`SA_RESTART` silently defeating prompt trap
-       delivery).
+       Job control (§2.9.3.1, XSI): each foreground pipeline/external
+       command/subshell gets its own process group (`setpgid(2)`, the
+       standard "both parent and child call it" race-safe idiom) and is
+       handed the controlling terminal (`tcsetpgrp(2)`, best-effort -
+       harmless without one); a group that stops (Ctrl-Z/`SIGTSTP`)
+       is detected via a `WUNTRACED` wait, registered as a job, and
+       reported once, before the next prompt. `enableJobControl()` (only
+       ever called by `main.cpp`, only when actually interactive) puts
+       the shell in its own group and ignores `SIGTSTP`/`SIGTTIN`/
+       `SIGTTOU` for itself; every forked descendant resets them to
+       default. When job control isn't active (every non-interactive run,
+       and every one of ush's own forked descendants - see
+       `isJobControlShell_`), every fork point behaves exactly as it did
+       before job control existed: no groups, no terminal handoff, no
+       job table. See the "known hard corners" above for four real bugs
+       the tests caught (fork+stdio buffer duplication; `lstat` vs
+       `stat` on symlinked directories; `signal` vs `sigaction`/
+       `SA_RESTART` silently defeating prompt trap delivery; a stop
+       signal getting lost inside the "double fork" for a backgrounded
+       external command/pipeline stage, fixed by making every
+       intermediate layer mirror a child's stop with `raise(SIGSTOP)` on
+       itself). **Not implemented**: `SIGTTIN`/`SIGTTOU`-driven
+       background-job terminal-access suspension, `%+`/`%-` as distinct
+       from a generic "current job", and stopped-then-re-stopped jobs
+       keeping a stable job number across an `fg` cycle.
 6. [x] Special built-ins (§2.14, `src/exec/builtins.cpp`): `:`, `.`,
        `break`, `continue`, `eval`, `exec`, `exit`, `export`, `readonly`,
        `return`, `set` (positional-parameter form only - option flags
@@ -393,12 +459,12 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        `getopts` (bundled short options, `OPTARG`/`OPTIND`, silent mode
        via a leading `:` - the "which character within the current arg"
        position POSIX leaves as shell-internal state lives in an
-       internal env var, `_ush_getopts_charidx`), `wait` (best-effort:
-       reaps *all* children with no argument, since there's no job
-       table yet - see item 8), `umask`, `kill` (`-signal`/`-l`, sharing
-       the same name/number table as `trap` - no `%job` operand, since
-       there's no job table). **Not implemented**: `hash`, `alias`/
-       `unalias`.
+       internal env var, `_ush_getopts_charidx`), `wait` (a bare `pid` or
+       a `%job` operand; with no argument, reaps *all* children), `umask`,
+       `kill` (`-signal`/`-l`, plus a `%job` operand that signals the
+       job's whole process group), `jobs` (`-l`), `fg`/`bg` (`%job`, or
+       the current job with no operand). **Not implemented**: `hash`,
+       `alias`/`unalias`.
 8. [~] Interactive mode (`src/main.cpp`'s `runInteractive`): a real REPL -
        prompts with `PS1`/`PS2` (expanded the same as any other word:
        tilde/parameter/command/arithmetic + quote removal), reads and
@@ -419,15 +485,17 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        the hard-corners note) rather than covered by an automated test,
        since reliably automating signal/process-group timing tends to
        be a source of test flakiness rather than of confidence.
-       **Not implemented**: line editing beyond what the terminal's own
-       canonical mode provides for free (backspace, `^U`, `^W` - but no
-       arrow-key cursor movement or history recall), a real history
-       list, and job control (`bg`/`fg`/`jobs`, `SIGTSTP` handling,
-       XSI) - `main.cpp` also supports `ush -c 'cmd' [name [arg...]]`
-       and `ush script [arg...]` for non-interactive use, and `ush -i`
-       to force interactive mode without a real terminal (used by the
-       integration tests, and a real, if minor, usability feature in
-       its own right - matches other shells' `-i`).
+       Job control (see item 5) is fully wired up here too: `jobs`
+       are announced/reported at the right points in this loop's own
+       prompt cycle. **Not implemented**: line editing beyond what the
+       terminal's own canonical mode provides for free (backspace, `^U`,
+       `^W` - but no arrow-key cursor movement or history recall), and a
+       real history list. `main.cpp` also supports
+       `ush -c 'cmd' [name [arg...]]` and `ush script [arg...]` for
+       non-interactive use, and `ush -i` to force interactive mode
+       without a real terminal (used by the integration tests, and a
+       real, if minor, usability feature in its own right - matches
+       other shells' `-i`).
 9. [x] Integration test suite (`tests/integration/`) - runs the actual
        built `ush` binary (via `fork`+`execve`, not `popen`, to avoid a
        second layer of shell quoting) against real scripts and checks
@@ -442,10 +510,20 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        child process and requires it to react within ~5s despite being
        in the middle of a 30s `sleep` - a deliberately generous but still
        meaningful deadline, guarding against the `SA_RESTART` regression
-       coming back without being sensitive to CI timing noise.
+       coming back without being sensitive to CI timing noise. Job
+       control gets the same treatment: an `InteractiveSession` helper
+       (a live `ush -i` with pipe stdin/stdout the test drives
+       incrementally - reading a job's announced pid from mid-session
+       output before it can send that job a real signal, unlike every
+       other interactive test here) covers backgrounding, the `Done`
+       notification, a real `SIGTSTP` sent to a job's *process group*
+       (matching what a terminal's Ctrl-Z actually does - a test bug
+       where this was first sent to a single pid instead is exactly what
+       led to finding the "double fork" stop-mirroring bug in item 5),
+       `jobs`/`bg`/`fg`, and `wait %job`/`kill %job`.
 
 Items 1-9 above are all now at least minimally done; "broad POSIX from
 the start" meant the *architecture* supported the full grammar/expansion/
 execution model from day one, and it has - what's left is breadth within
-each piece (more built-ins, interactive line editing/history, job
-control) rather than architectural gaps.
+each piece (more built-ins, interactive line editing/history) rather
+than architectural gaps.

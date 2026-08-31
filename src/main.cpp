@@ -72,6 +72,13 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
     ::signal(SIGINT, SIG_IGN);
     ::signal(SIGQUIT, SIG_IGN);
 
+    // Puts the shell in its own process group and takes the controlling
+    // terminal (both best-effort - harmless if there isn't one, e.g. when
+    // testing via `-i` with piped stdin), and ignores the job-control
+    // signals (SIGTSTP/SIGTTIN/SIGTTOU) for the shell itself - see
+    // Executor::enableJobControl().
+    executor.enableJobControl();
+
     // Every parsed program must be kept alive for the rest of the session:
     // Executor keeps raw pointers into it for any function defined there
     // (see executor.hpp's lifetime note), and a function defined on one
@@ -92,6 +99,11 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
     // right before the session actually ends - see
     // Executor::runExitTrapIfSet().
     while (true) {
+        // Background/stopped job state changes are reported here, right
+        // before the next prompt - not asynchronously as they happen -
+        // matching real shells' default behavior.
+        if (!continuing) executor.updateAndNotifyJobs();
+
         std::string prompt =
             continuing ? expandPrompt(executor, env, "PS2", "> ")
                        : expandPrompt(executor, env, "PS1", ::geteuid() == 0 ? "# " : "$ ");

@@ -77,9 +77,57 @@ void installSignalDisposition(int signum, void (*handler)(int)) {
 // disposition right after fork(), before running anything else. Not used
 // for the async ("&") fork: a background job inheriting the shell's
 // ignored disposition (when interactive) is what real shells do too.
+// SIGTSTP/SIGTTIN/SIGTTOU are reset for the same reason once job control
+// exists (see Executor::enableJobControl()): the shell ignores them so
+// Ctrl-Z at the prompt (with no foreground job) does nothing, but a
+// foreground child must still be stoppable normally.
 void resetForegroundSignalsInChild() {
     ::signal(SIGINT, SIG_DFL);
     ::signal(SIGQUIT, SIG_DFL);
+    ::signal(SIGTSTP, SIG_DFL);
+    ::signal(SIGTTIN, SIG_DFL);
+    ::signal(SIGTTOU, SIG_DFL);
+}
+
+// Best-effort reconstruction of a word/command/pipeline's source text,
+// used only for job-table/notification display (`jobs`, "[n]+ Stopped
+// ...", the "[n] pid" line printed when backgrounding). Not a real
+// unparser: a word that isn't a single unquoted literal (i.e. anything
+// involving quotes or expansions) is shown as "...", and a compound
+// command is shown generically - good enough to recognize a job by, not
+// meant to reproduce the exact source.
+std::string describeWord(const Word& w) {
+    if (wordIsUnquotedLiteral(w)) return wordAsUnquotedLiteral(w);
+    return "...";
+}
+
+std::string describeCommand(const ast::Command& cmd) {
+    if (auto* simple = std::get_if<ast::SimpleCommand>(&cmd.value)) {
+        std::string s;
+        for (const auto& w : simple->words) {
+            if (!s.empty()) s += ' ';
+            s += describeWord(w);
+        }
+        return s.empty() ? "?" : s;
+    }
+    if (std::holds_alternative<ast::CompoundCommand>(cmd.value)) return "{ ... }";
+    return "function";  // FunctionDefinition - backgrounding one directly is rare
+}
+
+std::string describePipeline(const ast::Pipeline& p) {
+    std::string s;
+    if (p.negated) s += "! ";
+    for (std::size_t i = 0; i < p.commands.size(); ++i) {
+        if (i) s += " | ";
+        s += describeCommand(*p.commands[i]);
+    }
+    return s;
+}
+
+std::string describeAndOr(const ast::AndOr& ao) {
+    std::string s = describePipeline(ao.first);
+    if (!ao.rest.empty()) s += " ...";
+    return s;
 }
 
 // fork(2) duplicates the whole process, including any output sitting
@@ -209,11 +257,229 @@ int Executor::runExitTrapIfSet(int currentStatus) {
     return currentStatus;
 }
 
+// ---------------------------------------------------------------------
+// job control (§2.9.3.1, XSI)
+// ---------------------------------------------------------------------
+
+void Executor::enableJobControl() {
+    isJobControlShell_ = true;
+    shellPgid_ = ::getpid();
+    ::setpgid(0, 0);                        // best-effort; harmless if already a group leader
+    ::tcsetpgrp(STDIN_FILENO, shellPgid_);   // best-effort; fails harmlessly with no controlling tty
+    // The shell ignores these itself (so e.g. Ctrl-Z at an empty prompt
+    // does nothing); a foreground child gets them reset to default - see
+    // resetForegroundSignalsInChild().
+    installSignalDisposition(SIGTSTP, SIG_IGN);
+    installSignalDisposition(SIGTTIN, SIG_IGN);
+    installSignalDisposition(SIGTTOU, SIG_IGN);
+}
+
+int Executor::addJob(pid_t pgid, std::vector<pid_t> pids, std::string command, bool stopped) {
+    Job job;
+    job.id = nextJobId_++;
+    job.pgid = pgid;
+    job.pidDone.assign(pids.size(), false);
+    job.pids = std::move(pids);
+    job.command = std::move(command);
+    job.state = stopped ? Job::State::Stopped : Job::State::Running;
+    int id = job.id;
+    jobs_.push_back(std::move(job));
+    return id;
+}
+
+Executor::Job* Executor::findJob(int id) {
+    for (auto& j : jobs_) {
+        if (j.id == id) return &j;
+    }
+    return nullptr;
+}
+
+Executor::Job* Executor::currentJob() { return jobs_.empty() ? nullptr : &jobs_.back(); }
+
+void Executor::removeJob(int id) {
+    for (auto it = jobs_.begin(); it != jobs_.end(); ++it) {
+        if (it->id == id) {
+            jobs_.erase(it);
+            return;
+        }
+    }
+}
+
+void Executor::updateAndNotifyJobs() {
+    for (auto& job : jobs_) {
+        if (job.state == Job::State::Done) continue;
+        int wstatus = 0;
+        pid_t r;
+        while ((r = ::waitpid(-job.pgid, &wstatus, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
+            if (WIFCONTINUED(wstatus)) {
+                if (job.state != Job::State::Running) {
+                    job.state = Job::State::Running;
+                    job.notified = false;
+                }
+                continue;
+            }
+            if (WIFSTOPPED(wstatus)) {
+                if (job.state != Job::State::Stopped) {
+                    job.state = Job::State::Stopped;
+                    job.notified = false;
+                }
+                continue;
+            }
+            for (std::size_t i = 0; i < job.pids.size(); ++i) {
+                if (job.pids[i] == r && !job.pidDone[i]) {
+                    job.pidDone[i] = true;
+                    if (i + 1 == job.pids.size()) job.exitStatus = statusFromWait(wstatus);
+                    break;
+                }
+            }
+        }
+        bool allDone = true;
+        for (bool d : job.pidDone) {
+            if (!d) {
+                allDone = false;
+                break;
+            }
+        }
+        if (allDone && job.state != Job::State::Done) {
+            job.state = Job::State::Done;
+            job.notified = false;
+        }
+    }
+
+    for (auto it = jobs_.begin(); it != jobs_.end();) {
+        if (!it->notified && (it->state == Job::State::Done || it->state == Job::State::Stopped)) {
+            std::string label = it->state == Job::State::Done
+                                     ? (it->exitStatus == 0 ? "Done"
+                                                             : "Done(" + std::to_string(it->exitStatus) + ")")
+                                     : "Stopped";
+            std::printf("[%d]+  %-24s%s\n", it->id, label.c_str(), it->command.c_str());
+            it->notified = true;
+        }
+        if (it->state == Job::State::Done) {
+            it = jobs_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+int Executor::resumeJob(Job& job, bool foreground) {
+    pid_t pgid = job.pgid;
+    std::vector<pid_t> pids = job.pids;
+    std::string command = job.command;
+    int id = job.id;
+
+    ::kill(-pgid, SIGCONT);
+
+    if (!foreground) {
+        job.state = Job::State::Running;
+        job.notified = false;
+        std::printf("[%d]+  %s &\n", id, command.c_str());
+        return 0;
+    }
+
+    for (auto it = jobs_.begin(); it != jobs_.end(); ++it) {
+        if (it->id == id) {
+            jobs_.erase(it);
+            break;
+        }
+    }
+    std::printf("%s\n", command.c_str());
+    return waitForJob(pgid, pids, /*foreground=*/true, command);
+}
+
+int Executor::waitForJob(pid_t pgid, const std::vector<pid_t>& pids, bool foreground,
+                          const std::string& command) {
+    if (!isJobControlShell_) {
+        // No job control active: a plain sequential wait, identical to
+        // the pre-job-control behavior (no groups, no terminal, no job
+        // table entry even if something here would otherwise "stop" -
+        // WUNTRACED is never passed, so a stop is invisible and the wait
+        // just continues, matching a shell with no job control at all).
+        int lastStatus = 1;
+        for (std::size_t i = 0; i < pids.size(); ++i) {
+            int wstatus = 0;
+            waitForChild(pids[i], &wstatus);
+            if (i + 1 == pids.size()) lastStatus = statusFromWait(wstatus);
+        }
+        return lastStatus;
+    }
+
+    if (foreground) ::tcsetpgrp(STDIN_FILENO, pgid);  // best-effort
+
+    pid_t lastPid = pids.back();
+    int lastPidStatus = 1;
+    std::vector<bool> done(pids.size(), false);
+    std::size_t remaining = pids.size();
+    bool stopped = false;
+
+    while (remaining > 0) {
+        int wstatus = 0;
+        pid_t r = ::waitpid(-pgid, &wstatus, WUNTRACED);
+        if (r < 0) {
+            if (errno == EINTR) {
+                servicePendingTraps();
+                continue;
+            }
+            break;
+        }
+        if (WIFSTOPPED(wstatus)) {
+            stopped = true;
+            break;
+        }
+        for (std::size_t i = 0; i < pids.size(); ++i) {
+            if (pids[i] == r && !done[i]) {
+                done[i] = true;
+                --remaining;
+                break;
+            }
+        }
+        if (r == lastPid) lastPidStatus = statusFromWait(wstatus);
+    }
+
+    if (foreground) ::tcsetpgrp(STDIN_FILENO, shellPgid_);  // reclaim, best-effort
+
+    if (stopped) {
+        // Notification is left to updateAndNotifyJobs() (called before
+        // the next prompt) rather than printed here too, so it happens
+        // exactly once.
+        addJob(pgid, pids, command, /*stopped=*/true);
+        return 128 + SIGTSTP;
+    }
+    return lastPidStatus;
+}
+
 pid_t Executor::waitForChild(pid_t pid, int* status) {
     while (true) {
-        pid_t r = ::waitpid(pid, status, 0);
-        if (r >= 0 || errno != EINTR) return r;
-        servicePendingTraps();
+        pid_t r = ::waitpid(pid, status, WUNTRACED);
+        if (r < 0) {
+            if (errno == EINTR) {
+                servicePendingTraps();
+                continue;
+            }
+            return r;
+        }
+        if (WIFSTOPPED(*status)) {
+            // This process isn't the one doing job-control bookkeeping
+            // for `pid` (see waitForJob() for that) - it's some
+            // intermediate layer created by the "double fork" for a
+            // pipeline stage/subshell/external command nested inside an
+            // already-established job (see runCommand()'s header
+            // comment). If `pid` stopped, it's almost certainly because
+            // a real, group-wide SIGTSTP (Ctrl-Z) reached this whole
+            // process tree, which inherited its process group from
+            // further up. The only way whichever ancestor *is* watching
+            // that group (via waitForJob()'s WUNTRACED wait) can see the
+            // whole subtree stop together is if every intermediate layer
+            // visibly stops too - so mirror it here. SIGSTOP can't be
+            // blocked or ignored, so this always takes effect
+            // immediately, and resuming (SIGCONT, sent group-wide by
+            // `bg`/`fg`) resumes both this process and `pid` together,
+            // letting the loop below fall through to an ordinary wait.
+            ::raise(SIGSTOP);
+            continue;
+        }
+        return r;
     }
 }
 
@@ -277,6 +543,7 @@ std::string Executor::runAndCaptureStdout(const std::string& source) {
         return "";
     }
     if (pid == 0) {
+        isJobControlShell_ = false;  // never job-control in a forked descendant
         resetForegroundSignalsInChild();
         ::close(pipefd[0]);
         ::dup2(pipefd[1], 1);
@@ -316,9 +583,14 @@ int Executor::runList(const ast::List& list) {
     int status = 0;
     for (const auto& item : list.items) {
         if (item.sep == ast::Separator::Async) {
+            bool jc = isJobControlShell_;
+            std::string desc = describeAndOr(item.andOr);
             flushStdioBeforeFork();
             pid_t pid = ::fork();
             if (pid == 0) {
+                isJobControlShell_ = false;
+                if (jc) ::setpgid(0, 0);  // own process group: isolated from the shell's, so
+                                          // interactive Ctrl-C/Ctrl-Z at the prompt don't touch it
                 int s = 1;
                 try {
                     s = runAndOr(item.andOr);
@@ -327,7 +599,14 @@ int Executor::runList(const ast::List& list) {
                 }
                 exitChild(s);
             }
-            if (pid > 0) env_.lastBackgroundPid = static_cast<int>(pid);
+            if (pid > 0) {
+                env_.lastBackgroundPid = static_cast<int>(pid);
+                if (jc) {
+                    ::setpgid(pid, pid);  // also from the parent side - race-safe idiom
+                    int id = addJob(pid, {pid}, desc, /*stopped=*/false);
+                    std::printf("[%d] %d\n", id, static_cast<int>(pid));
+                }
+            }
             status = 0;  // §2.9.3: an async list's exit status is 0
             env_.lastExitStatus = status;
         } else {
@@ -357,12 +636,19 @@ int Executor::runAndOr(const ast::AndOr& andOr) {
 }
 
 int Executor::runPipeline(const ast::Pipeline& pipeline) {
+    // Set unconditionally (job control active or not - cheap) so it's
+    // always ready for whichever fork point ends up consulting it; see
+    // the member's doc comment on why nested pipelines overwriting it
+    // before that point is safe.
+    currentPipelineDescription_ = describePipeline(pipeline);
+
     std::size_t n = pipeline.commands.size();
     int status;
 
     if (n == 1) {
         status = runCommand(*pipeline.commands[0]);
     } else {
+        bool jc = isJobControlShell_;
         std::vector<std::array<int, 2>> pipes(n - 1);
         for (auto& p : pipes) {
             if (::pipe(p.data()) != 0) {
@@ -371,11 +657,14 @@ int Executor::runPipeline(const ast::Pipeline& pipeline) {
             }
         }
         std::vector<pid_t> pids(n);
+        pid_t pgid = 0;
         for (std::size_t i = 0; i < n; ++i) {
             flushStdioBeforeFork();
             pid_t pid = ::fork();
             if (pid == 0) {
+                isJobControlShell_ = false;
                 resetForegroundSignalsInChild();
+                if (jc) ::setpgid(0, pgid);  // pgid==0 here (first stage): become the leader
                 if (i > 0) ::dup2(pipes[i - 1][0], 0);
                 if (i + 1 < n) ::dup2(pipes[i][1], 1);
                 for (auto& p : pipes) {
@@ -390,19 +679,27 @@ int Executor::runPipeline(const ast::Pipeline& pipeline) {
                 }
                 exitChild(s);
             }
+            if (jc) {
+                if (i == 0) pgid = pid;  // first child's pid becomes the whole pipeline's pgid
+                ::setpgid(pid, pgid);    // also from the parent side - race-safe idiom
+            }
             pids[i] = pid;
         }
         for (auto& p : pipes) {
             ::close(p[0]);
             ::close(p[1]);
         }
-        int lastStatus = 1;
-        for (std::size_t i = 0; i < n; ++i) {
-            int wstatus = 0;
-            waitForChild(pids[i], &wstatus);
-            if (i + 1 == n) lastStatus = statusFromWait(wstatus);
+        if (jc) {
+            status = waitForJob(pgid, pids, /*foreground=*/true, currentPipelineDescription_);
+        } else {
+            int lastStatus = 1;
+            for (std::size_t i = 0; i < n; ++i) {
+                int wstatus = 0;
+                waitForChild(pids[i], &wstatus);
+                if (i + 1 == n) lastStatus = statusFromWait(wstatus);
+            }
+            status = lastStatus;
         }
-        status = lastStatus;
     }
 
     return pipeline.negated ? (status == 0 ? 1 : 0) : status;
@@ -555,6 +852,7 @@ int Executor::runNameDirectly(const std::vector<std::string>& args) {
 int Executor::execExternal(const std::string& name, const std::vector<std::string>& args,
                             const std::vector<ast::Redirect>& redirects,
                             const std::vector<std::string>& envOverrides) {
+    bool jc = isJobControlShell_;
     flushStdioBeforeFork();
     pid_t pid = ::fork();
     if (pid < 0) {
@@ -562,7 +860,9 @@ int Executor::execExternal(const std::string& name, const std::vector<std::strin
         return 1;
     }
     if (pid == 0) {
+        isJobControlShell_ = false;
         resetForegroundSignalsInChild();
+        if (jc) ::setpgid(0, 0);
         if (!applyRedirects(redirects, nullptr)) exitChild(1);
 
         std::vector<std::string> envStrings = env_.exportedEnviron();
@@ -601,6 +901,10 @@ int Executor::execExternal(const std::string& name, const std::vector<std::strin
         exitChild(foundExecutable ? 126 : 127);
     }
 
+    if (jc) {
+        ::setpgid(pid, pid);
+        return waitForJob(pid, {pid}, /*foreground=*/true, currentPipelineDescription_);
+    }
     int wstatus = 0;
     waitForChild(pid, &wstatus);
     return statusFromWait(wstatus);
@@ -688,6 +992,7 @@ int Executor::runCaseClause(const ast::CaseClause& cc) {
 }
 
 int Executor::runSubshell(const ast::Subshell& sh) {
+    bool jc = isJobControlShell_;
     flushStdioBeforeFork();
     pid_t pid = ::fork();
     if (pid < 0) {
@@ -695,7 +1000,9 @@ int Executor::runSubshell(const ast::Subshell& sh) {
         return 1;
     }
     if (pid == 0) {
+        isJobControlShell_ = false;
         resetForegroundSignalsInChild();
+        if (jc) ::setpgid(0, 0);
         int status = 1;
         try {
             status = runList(sh.body);
@@ -703,6 +1010,10 @@ int Executor::runSubshell(const ast::Subshell& sh) {
             status = e.status;
         }
         exitChild(status);
+    }
+    if (jc) {
+        ::setpgid(pid, pid);
+        return waitForJob(pid, {pid}, /*foreground=*/true, currentPipelineDescription_);
     }
     int wstatus = 0;
     waitForChild(pid, &wstatus);

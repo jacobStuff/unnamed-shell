@@ -6,11 +6,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -93,6 +96,98 @@ RunResult runUsh(const std::string& script, const std::vector<std::string>& extr
 RunResult runUshInteractive(const std::string& stdinScript) {
     return runUshWithArgv({USH_BINARY_PATH, "-i"}, stdinScript);
 }
+
+// A live `ush -i` session with its stdin/stdout as pipes the test can
+// drive incrementally - needed for job-control tests, which have to read
+// a job's announced pid from mid-session output before they can send it
+// a real signal, unlike every other interactive test here (which can
+// just feed the whole script upfront and check the combined output at
+// the end).
+class InteractiveSession {
+public:
+    InteractiveSession() {
+        int inPipe[2], outPipe[2];
+        REQUIRE(::pipe(inPipe) == 0);
+        REQUIRE(::pipe(outPipe) == 0);
+        pid_ = ::fork();
+        REQUIRE(pid_ >= 0);
+        if (pid_ == 0) {
+            ::dup2(inPipe[0], 0);
+            ::dup2(outPipe[1], 1);
+            ::dup2(outPipe[1], 2);
+            ::close(inPipe[0]);
+            ::close(inPipe[1]);
+            ::close(outPipe[0]);
+            ::close(outPipe[1]);
+            std::vector<std::string> args = {USH_BINARY_PATH, "-i"};
+            std::vector<char*> argv;
+            for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+            argv.push_back(nullptr);
+            ::execv(USH_BINARY_PATH, argv.data());
+            _exit(127);
+        }
+        ::close(inPipe[0]);
+        ::close(outPipe[1]);
+        stdinFd_ = inPipe[1];
+        stdoutFd_ = outPipe[0];
+    }
+    ~InteractiveSession() {
+        if (stdinFd_ >= 0) ::close(stdinFd_);
+        if (stdoutFd_ >= 0) ::close(stdoutFd_);
+        if (pid_ > 0) {
+            ::kill(pid_, SIGKILL);
+            int wstatus = 0;
+            ::waitpid(pid_, &wstatus, 0);
+        }
+    }
+
+    pid_t pid() const { return pid_; }
+
+    void send(const std::string& line) {
+        std::string s = line + "\n";
+        ::write(stdinFd_, s.data(), s.size());
+    }
+
+    // Reads whatever output arrives within `timeoutMs` of the last byte
+    // received (not a fixed total deadline): keeps reading as long as
+    // more shows up, so a slow-but-eventually-responsive command doesn't
+    // race a fixed budget, while a truly-finished burst of output doesn't
+    // force the full timeout to elapse either.
+    std::string readAvailable(int timeoutMs = 2000) {
+        std::string result;
+        char buf[4096];
+        while (true) {
+            struct pollfd pfd {
+                stdoutFd_, POLLIN, 0
+            };
+            int r = ::poll(&pfd, 1, timeoutMs);
+            if (r <= 0 || !(pfd.revents & POLLIN)) break;
+            ssize_t n = ::read(stdoutFd_, buf, sizeof(buf));
+            if (n <= 0) break;
+            result.append(buf, static_cast<std::size_t>(n));
+        }
+        return result;
+    }
+
+    int finish() {
+        if (stdinFd_ >= 0) {
+            ::close(stdinFd_);
+            stdinFd_ = -1;
+        }
+        int wstatus = 0;
+        pid_t r;
+        while ((r = ::waitpid(pid_, &wstatus, 0)) < 0 && errno == EINTR) {
+        }
+        pid_t donePid = pid_;
+        pid_ = -1;  // finished (or failed) - the destructor shouldn't try again
+        return r == donePid && WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : (128 + WTERMSIG(wstatus));
+    }
+
+private:
+    pid_t pid_ = -1;
+    int stdinFd_ = -1;
+    int stdoutFd_ = -1;
+};
 
 class TempDir {
 public:
@@ -420,7 +515,7 @@ TEST_CASE("setting PS1 takes effect starting with the next prompt", "[integratio
     CHECK(r.output == "$ myprompt> after\nmyprompt> \n");
 }
 
-TEST_CASE("-i combined with -c just runs non-interactively (documented simplification)",
+TEST_CASE("passing -i together with -c just runs non-interactively (documented simplification)",
           "[integration]") {
     auto r = runUshWithArgv({USH_BINARY_PATH, "-i", "-c", "echo hi"}, "");
     CHECK(r.output == "hi\n");
@@ -515,4 +610,121 @@ TEST_CASE("a signal trap interrupts a blocked wait on a foreground child promptl
     REQUIRE(exited);
     CHECK(WIFEXITED(wstatus));
     CHECK(WEXITSTATUS(wstatus) == 7);
+}
+
+// --- job control ---------------------------------------------------------
+
+namespace {
+// Parses the pid out of a "[<jobId>] <pid>" announcement line (printed
+// when a job is backgrounded, or echoed back by `bg`/`fg` style commands
+// in some of these tests) - returns -1 if not found.
+long extractAnnouncedPid(const std::string& output, int jobId) {
+    std::string marker = "[" + std::to_string(jobId) + "] ";
+    auto pos = output.find(marker);
+    if (pos == std::string::npos) return -1;
+    pos += marker.size();
+    std::size_t end = pos;
+    while (end < output.size() && std::isdigit(static_cast<unsigned char>(output[end]))) ++end;
+    if (end == pos) return -1;
+    try {
+        return std::stol(output.substr(pos, end - pos));
+    } catch (...) {
+        return -1;
+    }
+}
+}  // namespace
+
+TEST_CASE("non-interactive mode never announces or tracks jobs", "[integration]") {
+    auto r = runUsh("sleep 0.1 & echo main; wait; echo done");
+    CHECK(r.output == "main\ndone\n");  // no "[1] <pid>" line
+}
+
+TEST_CASE("backgrounding a job announces it and jobs lists it as Running",
+          "[integration]") {
+    InteractiveSession s;
+    std::string out = s.readAvailable();  // initial prompt
+    s.send("sleep 30 &");
+    out = s.readAvailable();
+    CHECK(extractAnnouncedPid(out, 1) > 0);
+
+    s.send("jobs");
+    out = s.readAvailable();
+    CHECK(out.find("Running") != std::string::npos);
+    CHECK(out.find("sleep 30") != std::string::npos);
+
+    s.send("kill %1");
+    s.readAvailable();
+    s.send("wait");
+    s.finish();
+}
+
+TEST_CASE("a completed background job is reported Done before the next prompt",
+          "[integration]") {
+    InteractiveSession s;
+    s.readAvailable();
+    s.send("sleep 0.2 &");
+    s.readAvailable();
+    s.send("sleep 0.5");  // foreground: gives the background job time to finish
+    std::string out = s.readAvailable(3000);
+    CHECK(out.find("Done") != std::string::npos);
+    CHECK(out.find("sleep 0.2") != std::string::npos);
+    s.finish();
+}
+
+TEST_CASE("a job stopped by SIGTSTP is reported, then resumable via bg and reachable via jobs",
+          "[integration]") {
+    InteractiveSession s;
+    s.readAvailable();
+    s.send("sleep 30 &");
+    std::string out = s.readAvailable();
+    long pid = extractAnnouncedPid(out, 1);
+    REQUIRE(pid > 0);
+
+    // A single backgrounded external command is its own process group
+    // leader (pgid == its own pid) - see runList()'s async handling in
+    // executor.cpp. A real terminal's Ctrl-Z signals the whole foreground
+    // *group*, not one process - kill(2) needs the negated pid for that.
+    REQUIRE(::kill(-static_cast<pid_t>(pid), SIGTSTP) == 0);
+    // kill(2) returning just means the signal was queued, not that the
+    // target has actually finished transitioning to the stopped state
+    // yet - give it a moment before asking the shell to notice.
+    ::usleep(200000);
+
+    s.send("jobs");
+    out = s.readAvailable();
+    CHECK(out.find("Stopped") != std::string::npos);
+
+    s.send("bg %1");
+    out = s.readAvailable();
+    CHECK(out.find("&") != std::string::npos);  // bg's "[1]+  sleep 30 &" echo
+
+    s.send("jobs");
+    out = s.readAvailable();
+    CHECK(out.find("Running") != std::string::npos);
+
+    s.send("kill %1");
+    s.readAvailable();
+    s.send("wait");
+    s.finish();
+}
+
+TEST_CASE("fg brings a background job to the foreground and waits for it",
+          "[integration]") {
+    InteractiveSession s;
+    s.readAvailable();
+    s.send("sleep 0.3 &");
+    s.readAvailable();
+    s.send("fg");
+    std::string out = s.readAvailable(3000);
+    CHECK(out.find("sleep 0.3") != std::string::npos);  // fg's own echo of the command
+
+    s.send("echo after-fg");
+    out = s.readAvailable();
+    CHECK(out.find("after-fg") != std::string::npos);
+    s.send("jobs");
+    out = s.readAvailable();
+    CHECK(out.find("Running") == std::string::npos);  // fg's job is gone, not still listed
+    CHECK(out.find("Stopped") == std::string::npos);
+
+    s.finish();
 }

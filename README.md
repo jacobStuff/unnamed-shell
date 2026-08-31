@@ -32,8 +32,11 @@ echo 'echo hi' | ./build/src/ush              # run a script from stdin (non-int
 ```
 
 Interactive mode has a real prompt (`PS1`/`PS2`, both expanded like any
-other word) and multi-line continuation for anything left unfinished
-(an open quote, an `if` without its `fi` yet, a trailing `&&`, ...), but
+other word), multi-line continuation for anything left unfinished
+(an open quote, an `if` without its `fi` yet, a trailing `&&`, ...), and
+job control (`&` to background, `Ctrl-Z` to stop the foreground job,
+`jobs`/`fg`/`bg`/`kill %n`/`wait %n` to manage it, with terminal control
+handed back and forth between the shell and each foreground job), but
 no arrow-key history/cursor movement beyond what the terminal's own
 canonical line mode provides for free (backspace, `^U`, `^W`) - see the
 roadmap.
@@ -48,21 +51,25 @@ expansion grammar, command substitution, arithmetic expansion, field
 splitting, pathname expansion, quote removal), the executor (§2.9/§2.7 -
 fork/exec/pipelines/redirection/all compound commands/functions), a real
 interactive REPL (prompts, multi-line continuation, `Ctrl-C` no longer
-killing the shell), and real trap/signal handling (`trap`, an `EXIT`
+killing the shell), real trap/signal handling (`trap`, an `EXIT`
 handler that runs exactly once, and signals that interrupt a running
-foreground command promptly rather than waiting for it to finish first).
-Built-ins: every POSIX special built-in, plus a practical regular set -
-`cd`, `pwd`, `echo`, `printf`, `read`, `test`/`[`, `true`, `false`,
-`command`, `type`, `getopts`, `wait`, `umask`, `kill`. Done and tested:
-905 assertions across 179 cases, including integration tests that run
-the actual built binary end to end (interactively too, via `-i`, and
-including sending a real signal to a running child process).
+foreground command promptly rather than waiting for it to finish first),
+and job control (process groups, terminal-control handoff via
+`tcsetpgrp`, `Ctrl-Z` to stop a foreground job, and a real job table
+backing `jobs`/`fg`/`bg`/`kill %n`/`wait %n`). Built-ins: every POSIX
+special built-in, plus a practical regular set - `cd`, `pwd`, `echo`,
+`printf`, `read`, `test`/`[`, `true`, `false`, `command`, `type`,
+`getopts`, `wait`, `umask`, `kill`, `jobs`, `fg`, `bg`. Done and tested:
+935 assertions across 184 cases, including integration tests that run
+the actual built binary end to end (interactively too, via `-i`,
+including sending real signals - both to interrupt a running child and
+to stop/continue a whole job's process group).
 
-Still to come: job control (`jobs`/`bg`/`fg` - `wait` exists but is
-best-effort with no job table yet), a couple of niche built-ins (`hash`,
-`alias`), and real line editing/history (arrow-key recall, cursor
-movement). See the roadmap in
-[docs/DESIGN.md](docs/DESIGN.md#status--roadmap).
+Still to come: a couple of niche built-ins (`hash`, `alias`/`unalias`),
+real line editing/history (arrow-key recall, cursor movement),
+`SIGTTIN`/`SIGTTOU`-driven suspension of background jobs that touch the
+terminal, and a proper `%+`/`%-` distinction between jobs. See the
+roadmap in [docs/DESIGN.md](docs/DESIGN.md#status--roadmap).
 
 ## License
 

@@ -122,6 +122,62 @@ public:
     // those once per input line, not once per session).
     int runExitTrapIfSet(int currentStatus);
 
+    // --- job control (§2.9.3.1 "Asynchronous Lists", XSI) ---------------
+    //
+    // Only ever active when the process is actually the interactive shell
+    // itself, never in any of its forked descendants - see the comment on
+    // isJobControlShell_. When inactive, every foreground/background
+    // command runs exactly as it did before job control existed: no
+    // process groups, no terminal handoff, no job table - see
+    // docs/DESIGN.md for why that matters and how it's guaranteed.
+
+    struct Job {
+        int id;
+        pid_t pgid;
+        std::vector<pid_t> pids;
+        std::vector<bool> pidDone;  // parallel to pids; job is Done once all are true
+        std::string command;
+        enum class State { Running, Stopped, Done } state;
+        int exitStatus = 0;  // meaningful once state == Done; from pids.back() specifically
+        bool notified = false;
+    };
+
+    // Called by main.cpp exactly once, only when actually interactive
+    // with a controlling terminal: puts the shell in its own process
+    // group and takes the terminal, so subsequently-created jobs can each
+    // get their own group and have it handed to them in turn.
+    void enableJobControl();
+    bool jobControlActive() const { return isJobControlShell_; }
+
+    // Reaps every job's processes that have changed state since the last
+    // call (non-blocking) and prints "[n]+ Done"/"[n]+ Stopped"
+    // notifications for ones not already reported - called before each
+    // interactive prompt, and by the `jobs`/`wait` built-ins.
+    void updateAndNotifyJobs();
+
+    const std::vector<Job>& jobs() const { return jobs_; }
+    // Job lookup for `fg`/`bg`/`wait`'s "%n" operands; nullptr if no such
+    // job (already reaped, or never existed).
+    Job* findJob(int id);
+    // Removes `id` from the table directly, with no attempt to reap it -
+    // for a caller (namely `wait %job`) that has already reaped the job's
+    // processes itself via its own waitpid(2) calls, and so has nothing
+    // left for updateAndNotifyJobs()'s own group-wide reaping loop to
+    // observe (that syscall-level wait event was already consumed).
+    // Calling updateAndNotifyJobs() instead in that situation would leave
+    // the job stuck in the table forever, looking perpetually Stopped/
+    // Running.
+    void removeJob(int id);
+    // The job most recently made current (POSIX's "current job", `%%`/
+    // `%+`) - the last one added or referenced - or nullptr if none.
+    Job* currentJob();
+
+    // Sends SIGCONT to `job`'s process group and marks it Running. If
+    // `foreground`, also hands it the terminal and blocks until it exits
+    // or stops again (like a freshly-started foreground pipeline would);
+    // otherwise leaves it running in the background. Used by `fg`/`bg`.
+    int resumeJob(Job& job, bool foreground);
+
 private:
     Environment& env_;
     Expander expander_;
@@ -133,6 +189,44 @@ private:
     // Trap actions by condition (0 == EXIT). An empty string means
     // "ignore"; absence means "default disposition, not trapped".
     std::unordered_map<int, std::string> trapActions_;
+
+    std::vector<Job> jobs_;
+    int nextJobId_ = 1;
+
+    // True only in the actual, top-level interactive shell process -
+    // explicitly cleared to false in every forked child (right after
+    // fork, before anything else) so job-control logic (process groups,
+    // terminal ownership) never runs in a descendant, however deeply
+    // nested. See enableJobControl() and docs/DESIGN.md.
+    bool isJobControlShell_ = false;
+    pid_t shellPgid_ = 0;
+
+    // Set at the top of every runPipeline() call (whether or not job
+    // control is active) to a best-effort reconstruction of that
+    // pipeline's source text, purely for job-table/notification display.
+    // A member rather than a threaded parameter: nested pipeline
+    // executions (a compound command's body containing further commands)
+    // naturally overwrite it with a more specific description before any
+    // fork point that would actually consult it is reached - see
+    // docs/DESIGN.md for why that's safe rather than a real global-state
+    // hazard.
+    std::string currentPipelineDescription_;
+
+    int addJob(pid_t pgid, std::vector<pid_t> pids, std::string command, bool stopped);
+
+    // Waits for every process in `pgid` to exit (reaping each), unless
+    // job control is inactive, in which case this is a plain sequential
+    // wait for each of `pids` with no group semantics at all - identical
+    // to the pre-job-control behavior. When active: hands the group the
+    // terminal first if `foreground` (reclaimed after), and if the group
+    // stops (Ctrl-Z) rather than finishing, registers it as a Stopped
+    // job (using `command` for display), reports it, and returns early
+    // (128+SIGTSTP) without waiting for the rest. Otherwise returns the
+    // exit status of `pids.back()` specifically (the pipeline's last
+    // command - not just "whichever pid happens to finish last"), per
+    // §2.9.2's exit-status rule for pipelines.
+    int waitForJob(pid_t pgid, const std::vector<pid_t>& pids, bool foreground,
+                   const std::string& command);
 
     // waitpid(2) for `pid`, but servicing pending traps (see
     // servicePendingTraps()) and resuming the wait each time one is
