@@ -95,6 +95,17 @@ if(APPLE)
     # authorization if that requires elevated permissions, same as any
     # other .pkg that writes outside the user's home directory.
     set(CPACK_PACKAGING_INSTALL_PREFIX "/usr/local")
+    # Without this, productbuild's generated Distribution XML ends up
+    # with an empty <choices-outline/> - no <choice>/<pkg-ref> for the
+    # single (uncomponentized) install() rule at all - which leaves
+    # Installer.app with nothing selected and no way to select anything,
+    # so its Install button stays permanently greyed out. CPack's
+    # `install(TARGETS ush)` rule has no explicit COMPONENT, so
+    # everything lands in the implicit "Unspecified" component; naming
+    # it here is what makes productbuild actually advertise it as a
+    # choice. Caught by installing the real .pkg through Installer.app,
+    # not by cpack's own (silent, exit-0) output - see docs/PACKAGING.md.
+    set(CPACK_COMPONENTS_ALL Unspecified)
 elseif(UNIX)
     list(APPEND CPACK_GENERATOR "DEB" "RPM")
 

@@ -62,6 +62,19 @@ Two things worth knowing if you ever touch the CPack config:
   `.txt` copy is generated into the build tree at configure time
   (`configure_file(... COPYONLY)`) and used for every generator instead
   of branching per-platform - it's never checked into the repo.
+- **`productbuild` needs `CPACK_COMPONENTS_ALL` set even for a single,
+  uncomponentized `install()` rule**, or the generated Distribution XML
+  ends up with an empty `<choices-outline/>` - no `<choice>`/`<pkg-ref>`
+  at all - which leaves Installer.app with nothing selected and nothing
+  *selectable*, so its Install button stays permanently greyed out with
+  no way to proceed. `CPACK_COMPONENTS_ALL Unspecified` (CPack's own
+  name for the implicit component an unlabeled `install()` lands in)
+  fixes it. This one only showed up by actually opening the real `.pkg`
+  in Installer.app and clicking through it - inspecting the payload with
+  `pkgutil --expand-full` (below) doesn't catch it, since the payload
+  itself is completely correct; it's the installer *UI* that's broken.
+  After touching anything CPack/productbuild-related, click through the
+  real installer at least once, not just `pkgutil --expand-full` it.
 
 Verifying a `.pkg`/`.deb`/`.rpm` payload without actually installing it
 system-wide:
