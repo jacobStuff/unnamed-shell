@@ -46,6 +46,13 @@ public:
     // $HISTSIZE.
     void setMaxSize(std::size_t n);
 
+    // Discards every retained entry (`history -c`). History numbers keep
+    // climbing afterward rather than restarting at 1 - the next add()
+    // gets the number one past whatever was last used, same as trimming
+    // already does; nothing re-numbers past entries, there just aren't
+    // any left.
+    void clear();
+
     std::size_t size() const { return entries_.size(); }
     bool empty() const { return entries_.empty(); }
 

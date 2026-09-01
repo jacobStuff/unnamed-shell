@@ -32,7 +32,9 @@ echo 'echo hi' | ./build/src/ush              # run a script from stdin (non-int
 ```
 
 Interactive mode has a real prompt (`PS1`/`PS2`, both expanded like any
-other word), multi-line continuation for anything left unfinished
+other word, plus POSIX's one PS1-specific rule: an unescaped `!` becomes
+the next command's history number, `!!` a literal `!`), multi-line
+continuation for anything left unfinished
 (an open quote, an `if` without its `fi` yet, a trailing `&&`, ...),
 job control (`&` to background, `Ctrl-Z` to stop the foreground job,
 `jobs`/`fg`/`bg`/`kill %n`/`wait %n` to manage it, with terminal control
@@ -65,7 +67,7 @@ history. Built-ins: every POSIX special built-in, plus a practical
 regular set - `cd`, `pwd`, `echo`, `printf`, `read`, `test`/`[`, `true`,
 `false`, `command`, `type`, `getopts`, `wait`, `umask`, `kill`, `jobs`,
 `fg`, `bg`, `fc` (list/edit-and-reexecute/quick-reexecute a range of
-history), `history`. Done and tested: 1016 assertions across 204 cases,
+history), `history`. Done and tested: 1031 assertions across 206 cases,
 including integration tests that run the actual built binary end to end
 (interactively too, via `-i` and, for the line editor specifically, over
 a real pseudo-terminal - sending real signals, including to interrupt a

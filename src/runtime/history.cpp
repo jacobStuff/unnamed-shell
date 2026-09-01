@@ -16,6 +16,11 @@ void History::setMaxSize(std::size_t n) {
     trim();
 }
 
+void History::clear() {
+    firstNumber_ += entries_.size();
+    entries_.clear();
+}
+
 void History::add(std::string entry) {
     if (!entry.empty() && entry.back() == '\n') entry.pop_back();
     // "empty/all whitespace" - a bare Enter, or a continuation buffer that

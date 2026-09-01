@@ -391,6 +391,42 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   POSIX leaves `fc`'s default editor unspecified; this implementation
   picks `vi` (present on essentially every POSIX system, unlike e.g.
   `ed`) rather than trying to detect "the historical default."
+- **`PS1`/`PS2` get more expansion than §2.5.3's literal text asks for -
+  a deliberate, documented choice, not an oversight.** The spec says
+  each "shall be subjected to parameter expansion" only (§2.6.2) - not
+  tilde expansion, not command substitution, not arithmetic expansion.
+  Taken literally, that would make `PS1='$(pwd) $ '` - probably the
+  single most common real prompt customization - not work: `$(pwd)`
+  would appear in the prompt as the literal four characters `$`, `(`,
+  `p`... rather than being run. `expandPrompt()` in `main.cpp` runs PS1/
+  PS2 through the same tilde/parameter/command/arithmetic expansion (+
+  quote removal) any other word gets, deliberately going beyond the
+  letter of the spec for what's clearly the intent of "customizable
+  prompt string."
+- **PS1's `!`/`!!` substitution is a raw-text pass over the *variable's
+  own value*, done before any other prompt expansion runs - not a
+  post-pass over the final expanded/displayed string.** This matters
+  for a prompt like `PS1='$(echo !)'`: the `!` is part of PS1's literal
+  text (about to be handed to a command substitution as its script,
+  which will just echo it back), so it gets replaced with the history
+  number *first* - `$(echo 5)` - and command substitution then runs
+  that. The alternative (substituting `!` in the *output* of expansion)
+  would instead touch any literal `!` characters a command substitution
+  happens to print, which has nothing to do with what §2.5.3 is
+  describing ("the character '!' in PS1"). Also why this only applies to
+  PS1, never PS2/PS4 (see item 8's Status entry above) - the spec text
+  granting this treatment names PS1 specifically.
+- **A real bug, caught while implementing the above and unrelated to
+  it: `history -c` didn't actually clear anything.** It was implemented
+  as `setMaxSize(0)` (meant to drop everything by capping at zero)
+  immediately followed by `setMaxSize(500)` (meant to restore the normal
+  cap) - but `setMaxSize(0)` means *unlimited*, not *zero*, so it never
+  trimmed anything in the first place, and the very next call just
+  raised the cap back to 500 over a list that was never emptied. Fixed
+  by adding a real `History::clear()` (erases every entry, advances the
+  internal "next number" counter past them so numbering keeps climbing
+  rather than reusing numbers) instead of trying to express "clear" as
+  two cap changes.
 
 ## Status / roadmap
 
@@ -550,7 +586,16 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        implemented**: `hash`, `alias`/`unalias`.
 8. [x] Interactive mode (`src/main.cpp`'s `runInteractive`): a real REPL -
        prompts with `PS1`/`PS2` (expanded the same as any other word:
-       tilde/parameter/command/arithmetic + quote removal), reads and
+       tilde/parameter/command/arithmetic + quote removal - broader than
+       the letter of §2.5.3, which only mandates parameter expansion for
+       these; see "Known hard corners" below), plus §2.5.3's one PS1-
+       specific rule: an unescaped `!` in PS1's own text is replaced with
+       the history number the *next* command will get, and `!!` becomes
+       a literal `!` (`applyHistoryBang()`, applied to PS1's raw value
+       before the rest of prompt expansion runs - `PS1='[!] '` shows
+       `[1] ` for the first command, `[2] ` for the second, and so on).
+       Not implemented for PS2 or PS4 - POSIX gives that treatment to PS1
+       alone. Reads and
        parses incrementally so a `PS2` continuation prompt appears for
        any unfinished construct (unclosed quote, compound command,
        here-document, trailing `&&`/`|`/...), and recovers cleanly from

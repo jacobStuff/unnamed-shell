@@ -619,6 +619,21 @@ TEST_CASE("setting PS1 takes effect starting with the next prompt", "[integratio
     CHECK(r.output == "$ myprompt> after\nmyprompt> \n");
 }
 
+TEST_CASE("PS1's '!' is replaced with the next command's history number, '!!' with a literal '!'",
+          "[integration]") {
+    auto r = runUshInteractive("PS1='[!] '\necho one\necho two\nPS1='literal !! bang !$ '\necho three\n");
+    // The very first prompt is shown before any input has been read, so
+    // it still uses the default PS1 ("$ ") - the same off-by-one as
+    // "setting PS1 takes effect starting with the next prompt" above.
+    // From there: "PS1='[!] '" becomes history entry #1 -> next prompt
+    // "[2] " -> "echo one" (#2) -> "[3] " -> "echo two" (#3) -> "[4] " ->
+    // "PS1='literal !! bang !$ '" (#4) -> next prompt, with the new PS1
+    // and next number 5: "literal ! bang 5$ " ("!!" -> "!", "!$" -> "5"
+    // then literal "$ ") -> "echo three" (#5) -> "literal ! bang 6$ ".
+    CHECK(r.output ==
+          "$ [2] one\n[3] two\n[4] literal ! bang 5$ three\nliteral ! bang 6$ \n");
+}
+
 TEST_CASE("passing -i together with -c just runs non-interactively (documented simplification)",
           "[integration]") {
     auto r = runUshWithArgv({USH_BINARY_PATH, "-i", "-c", "echo hi"}, "");

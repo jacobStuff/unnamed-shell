@@ -91,6 +91,29 @@ TEST_CASE("setMaxSize(0) means unlimited", "[history]") {
     CHECK(h.size() == 4);  // b, c, d, e - no trimming once unlimited
 }
 
+TEST_CASE("clear() empties the list and keeps numbering climbing afterward", "[history]") {
+    History h;
+    h.add("a");
+    h.add("b");
+    h.add("c");
+    REQUIRE(h.lastNumber() == 3);
+
+    h.clear();
+    CHECK(h.empty());
+    CHECK(h.size() == 0);
+    CHECK(h.firstNumber() == 0);
+    CHECK(h.lastNumber() == 0);
+    CHECK(h.byNumber(1) == nullptr);
+    CHECK(h.byNumber(3) == nullptr);
+
+    h.add("d");
+    // "d" gets number 4, not 1 - clear() doesn't rewind numbering.
+    REQUIRE(h.size() == 1);
+    CHECK(h.firstNumber() == 4);
+    CHECK(h.lastNumber() == 4);
+    CHECK(*h.byNumber(4) == "d");
+}
+
 TEST_CASE("save() then load() round-trips the retained entries", "[history]") {
     fs::path path = fs::temp_directory_path() / "ush_history_roundtrip_test";
     std::error_code ec;

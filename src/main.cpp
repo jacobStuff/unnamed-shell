@@ -40,15 +40,42 @@ std::string readAll(std::istream& in) {
     return ss.str();
 }
 
+// PS1 only (§2.5.3): "The shell shall replace each instance of the
+// character '!' in PS1 with the history file number of the next command
+// to be typed. Escaping the '!' with another '!' (that is, "!!") shall
+// place the literal character '!' in the prompt." Operates on PS1's raw
+// value, before any further prompt expansion - a literal substitution on
+// the variable's own text, not on whatever a nested command substitution
+// happens to print.
+std::string applyHistoryBang(const std::string& raw, std::size_t nextCommandNumber) {
+    std::string out;
+    out.reserve(raw.size());
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] != '!') {
+            out += raw[i];
+            continue;
+        }
+        if (i + 1 < raw.size() && raw[i + 1] == '!') {
+            out += '!';
+            ++i;  // consume both '!'s, emit one
+        } else {
+            out += std::to_string(nextCommandNumber);
+        }
+    }
+    return out;
+}
+
 // Expands a prompt variable (PS1/PS2) the same way any other word would
 // be expanded (tilde/parameter/command/arithmetic + quote removal - no
 // field splitting or pathname expansion, since a prompt is one opaque
 // display string, not a command's argument list). Falls back to the raw
 // value (or default) if expansion itself fails, so a bad PS1 can't wedge
-// the prompt entirely.
+// the prompt entirely. `applyBang`: see applyHistoryBang() - true only
+// for PS1 (POSIX doesn't give PS2/PS4 the same "!" treatment).
 std::string expandPrompt(ush::Executor& executor, ush::Environment& env, const char* varName,
-                          const std::string& defaultValue) {
+                          const std::string& defaultValue, bool applyBang = false) {
     std::string raw = env.get(varName).value_or(defaultValue);
+    if (applyBang) raw = applyHistoryBang(raw, executor.history().lastNumber() + 1);
     try {
         ush::Lexer lex(raw);
         ush::Word word = lex.scanWordUntilEnd();
@@ -153,7 +180,8 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
 
             std::string prompt =
                 continuing ? expandPrompt(executor, env, "PS2", "> ")
-                           : expandPrompt(executor, env, "PS1", ::geteuid() == 0 ? "# " : "$ ");
+                           : expandPrompt(executor, env, "PS1", ::geteuid() == 0 ? "# " : "$ ",
+                                          /*applyBang=*/true);
 
             std::string line;
             if (useEditor) {

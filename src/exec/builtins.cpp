@@ -1109,11 +1109,7 @@ int biBg(Executor& ex, const std::vector<std::string>& args) {
 int biHistory(Executor& ex, const std::vector<std::string>& args) {
     History& hist = ex.history();
     if (args.size() > 1 && args[1] == "-c") {
-        hist.setMaxSize(0);  // drop everything retained...
-        hist.setMaxSize(500);
-        // ...then put a real cap back (matches the default in main.cpp;
-        // setMaxSize(0) alone would mean "unlimited" from here on, not
-        // "cleared").
+        hist.clear();
         return 0;
     }
     std::size_t from = hist.firstNumber();
