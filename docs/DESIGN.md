@@ -427,6 +427,80 @@ expansion stage can detect by inspecting the first `Literal` part directly.
   internal "next number" counter past them so numbering keeps climbing
   rather than reusing numbers) instead of trying to express "clear" as
   two cap changes.
+- **`$ENV`/`~/.ushrc` are deliberately NOT run through `.`/`eval`'s
+  machinery (`Executor::runSourceInCurrentContext`), even though
+  "source a file in the current environment" is exactly what that
+  function does - and this turned out to be the right call for a reason
+  beyond the one originally intended.** The original reason:
+  `runSourceInCurrentContext()` deliberately lets `exit`/`return`/
+  `break`/`continue` escape uncaught, on the assumption that whatever
+  called it (a loop body for break/continue, a function call for
+  return, `runProgramCatchingExit` for exit) will catch what applies to
+  its own context - but a startup file has no such enclosing context,
+  so those would simply crash the process as uncaught C++ exceptions.
+  The second, more serious reason, found while double-checking the
+  first one: `runSourceInCurrentContext`'s `ast::List` is a *local*,
+  destroyed the moment the call returns - and it turns out a function
+  *defined inside it* is NOT a self-contained, independent AST node the
+  way this note originally (incorrectly) assumed. `functions_` stores a
+  raw pointer straight into whichever `ast::List` was being run when the
+  definition was reached (see its own doc comment), so a function
+  defined via `eval`/`.` is left holding a dangling pointer the instant
+  that call returns - calling it later is undefined behavior, observed
+  in practice as a silent no-op (`type` still reports it as a function;
+  calling it produces no output and exit status 0, no crash, no error).
+  **This is a confirmed, pre-existing bug in `eval`/`.`, not something
+  this feature works around for them** - flagged separately for a real
+  fix (Executor needs to own the AST of anything it runs this way, not
+  rely on the caller to keep it alive, the way `runInteractive`'s
+  `programs` vector does for ordinary interactive lines). `~/.ushrc`/
+  `$ENV` simply never hit this bug because they were written from
+  scratch with their own `runStartupSource()`/`sourceStartupFile()`
+  lambdas, which parse the startup file into a program pushed onto that
+  same session-lifetime `programs` vector, then run it via
+  `runProgramCatchingExit()` (the exact same top-level tolerance every
+  interactively-typed line already gets) -
+  functionally "like `.`", just without going through the `.` builtin's
+  own code path.
+- **Every test that spawns an interactive `ush` must also override
+  `$HOME` (and unset `$ENV`), or it will run whatever's in the *real*
+  developer's actual `~/.ushrc`/`$ENV`-pointed file.** The same class of
+  problem as the HISTFILE isolation issue above, for the same reason (a
+  test process still inherits the real environment) - caught by
+  reasoning about it up front this time rather than by an actual
+  incident, since by now `~/.ushrc` existing for real (this project's
+  own author has since set ush as their login shell) was a real, not
+  hypothetical, risk. Every spawn point in the integration test file
+  (`runUshWithArgv`, `InteractiveSession`, `PtySession`) defaults `HOME`
+  to a fixed nonexistent path and unsets `ENV` outright, with optional
+  parameters to point at a real temp-directory `~/.ushrc` or `$ENV`
+  target for the tests that specifically exercise startup-file sourcing.
+- **A `TEST_CASE` name that happens to start with a character Catch2's
+  own CLI/test-spec parser treats specially breaks `ctest`'s discovery-
+  based invocation of it - silently, without failing.** `catch_discover_
+  tests` (CMake's Catch2 integration) generates one `ctest` entry per
+  `TEST_CASE`, each invoking the test binary with that exact name string
+  as a single positional argument - which Catch2 then parses as a test
+  *spec*, not literal text, so a name beginning with one of Catch2's
+  special spec characters is parsed as something else entirely instead
+  of matching just itself. Two real instances of this in this file so
+  far: a name starting with `"-i "` was parsed as Catch2's own `-i`/
+  `--invisibles` CLI flag (`ctest` reported that one test as failed,
+  "No test cases matched", since nothing named the empty remainder) -
+  fixed by rewording it to not start with `-i`. A name starting with
+  `"~/"` was parsed as a *negated* spec (`~pattern` means "everything
+  NOT matching pattern") - since nothing in the whole suite matches the
+  nonsensical remainder `/.ushrc is...`, the negation matched *every*
+  test, so `ctest` silently re-ran the entire 212-test suite under that
+  one test's name every time (**passing**, since every real test in it
+  still passed, but with wildly inflated - and easy to mistake for a
+  hang or a flaky test - timing: ~91s for what should have been a single
+  sub-second test, initially misread as evidence of a real bug before
+  `--list-tests` with the same string revealed it matched all 212 cases)
+  - fixed by rewording it to not start with `~`. The general lesson: a
+  `TEST_CASE` name is also, incidentally, a `ctest`-invocation command-
+  line argument, and needs to survive being parsed as one - avoid
+  leading `-`, `~`, `[`, and (to be safe) commas.
 
 ## Status / roadmap
 
@@ -631,7 +705,23 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        itself is active - piped/redirected stdin (`ush -i < script`,
        and every non-pty integration test) still falls back to plain
        line-at-a-time reading, matching real shells' behavior in the
-       same situation. **Not implemented**: completion (filename/
+       same situation. Before the first prompt, two startup files are
+       sourced in the shell's own environment (like `.` - not a
+       subshell, so variables/functions they set are visible for the
+       rest of the session): POSIX's `$ENV` (§2.5.3 - only when real and
+       effective uid/gid match, so a setuid/setgid `sh` can't be tricked
+       into running arbitrary commands via an inherited `ENV`), then
+       ush's own `~/.ushrc` - NOT part of POSIX, the same convention
+       bash's `~/.bashrc`/zsh's `~/.zshrc` follow, added on request
+       rather than because the spec asks for it. Either file's parsed
+       AST is kept alive for the session exactly like any other
+       interactively-typed line (so a function defined in `~/.ushrc` is
+       still callable later), a missing file of either kind is silently
+       skipped (not an error), a syntax error is reported but doesn't
+       stop the shell from starting, and `exit` from within either ends
+       the session immediately - see "Known hard corners" below for why
+       neither goes through the `.`/`eval` machinery. **Not
+       implemented**: completion (filename/
        command), a real vi editing mode (`set -o vi`/`-o emacs` aren't
        recognized as anything other than a no-op), and multi-byte
        UTF-8-aware cursor movement (each byte counts as one column).

@@ -65,17 +65,18 @@ std::string applyHistoryBang(const std::string& raw, std::size_t nextCommandNumb
     return out;
 }
 
-// Expands a prompt variable (PS1/PS2) the same way any other word would
-// be expanded (tilde/parameter/command/arithmetic + quote removal - no
-// field splitting or pathname expansion, since a prompt is one opaque
-// display string, not a command's argument list). Falls back to the raw
-// value (or default) if expansion itself fails, so a bad PS1 can't wedge
-// the prompt entirely. `applyBang`: see applyHistoryBang() - true only
-// for PS1 (POSIX doesn't give PS2/PS4 the same "!" treatment).
-std::string expandPrompt(ush::Executor& executor, ush::Environment& env, const char* varName,
-                          const std::string& defaultValue, bool applyBang = false) {
-    std::string raw = env.get(varName).value_or(defaultValue);
-    if (applyBang) raw = applyHistoryBang(raw, executor.history().lastNumber() + 1);
+// Expands `raw` the same way any other word would be (tilde/parameter/
+// command/arithmetic expansion + quote removal - no field splitting or
+// pathname expansion, since these are all "one opaque configuration
+// string" spots, not a command's argument list). Falls back to the raw
+// text unexpanded if expansion itself fails, so a bad value can't wedge
+// startup or the prompt entirely. Shared by PS1/PS2 (expandPrompt()
+// below) and $ENV - POSIX §2.5.3 only strictly requires *parameter*
+// expansion for either, but supporting the same expansion any other word
+// gets is more useful and is what's actually expected (`PS1='$(pwd) $ '`
+// is probably the single most common real prompt customization) - see
+// docs/DESIGN.md's "Known hard corners" for this deliberate choice.
+std::string expandConfigWord(ush::Executor& executor, const std::string& raw) {
     try {
         ush::Lexer lex(raw);
         ush::Word word = lex.scanWordUntilEnd();
@@ -83,6 +84,16 @@ std::string expandPrompt(ush::Executor& executor, ush::Environment& env, const c
     } catch (...) {
         return raw;
     }
+}
+
+// Expands a prompt variable (PS1/PS2). `applyBang`: see
+// applyHistoryBang() - true only for PS1 (POSIX doesn't give PS2/PS4 the
+// same "!" treatment).
+std::string expandPrompt(ush::Executor& executor, ush::Environment& env, const char* varName,
+                          const std::string& defaultValue, bool applyBang = false) {
+    std::string raw = env.get(varName).value_or(defaultValue);
+    if (applyBang) raw = applyHistoryBang(raw, executor.history().lastNumber() + 1);
+    return expandConfigWord(executor, raw);
 }
 
 // $HISTFILE, or ~/.ush_history if unset - std::nullopt (no persistence
@@ -142,6 +153,72 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
     // vector<unique_ptr<Command>>), not at the List/Pipeline structs
     // themselves.
     std::vector<ush::ast::List> programs;
+    int status = 0;
+
+    // Parses and runs `source` exactly as if it had been typed at the
+    // interactive prompt in one go (not via the `.`/eval machinery,
+    // which deliberately lets exit/return/break/continue escape to
+    // whatever called it - there's no such enclosing context for a
+    // startup file). `programs` is where the parsed AST lives - a
+    // function defined in a startup file must stay callable for the
+    // rest of the session exactly like one defined on any other line, so
+    // this can't just discard it after running. A syntax error is
+    // reported but doesn't stop the shell from starting, matching real
+    // shells' tolerance for a broken rc file. Returns true if `exit` was
+    // called from within `source` - the caller should end the session
+    // immediately, exactly as if EOF had been read at the very first
+    // prompt.
+    auto runStartupSource = [&](const std::string& source) -> bool {
+        ush::ast::List program;
+        try {
+            ush::Parser parser(source);
+            program = parser.parseProgram();
+        } catch (const ush::LexError& e) {
+            std::cerr << "ush: syntax error: " << e.what() << '\n';
+            return false;
+        } catch (const ush::ParseError& e) {
+            std::cerr << "ush: syntax error: " << e.what() << '\n';
+            return false;
+        }
+        programs.push_back(std::move(program));
+        auto outcome = executor.runProgramCatchingExit(programs.back());
+        if (outcome.exitRequested) status = outcome.status;
+        return outcome.exitRequested;
+    };
+    // As above, but for a file: silently does nothing if it doesn't
+    // exist or can't be opened - a missing startup file isn't an error,
+    // matching both POSIX's treatment of $ENV and real shells' `.bashrc`/
+    // `.zshrc` conventions.
+    auto sourceStartupFile = [&](const std::string& path) -> bool {
+        std::ifstream f(path);
+        if (!f) return false;
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return runStartupSource(ss.str());
+    };
+
+    // Startup files, run before the first prompt: POSIX's $ENV (§2.5.3 -
+    // only for an interactive shell, which this always is; skipped if
+    // real/effective uid or gid differ, so a setuid/setgid `sh` can't be
+    // tricked into running arbitrary commands via an inherited ENV) and
+    // ush's own ~/.ushrc - NOT part of POSIX, the same convention bash's
+    // ~/.bashrc and zsh's ~/.zshrc follow, added because that's
+    // specifically the feature asked for (see docs/DESIGN.md). Both run
+    // in the shell's current environment, like `.` - not a subshell - so
+    // variables/functions/aliases they set are visible for the rest of
+    // the session. $ENV runs first: it's an explicit, user-chosen
+    // override, so anything ~/.ushrc does afterward "wins" if the two
+    // happen to overlap.
+    bool exitedDuringStartup = false;
+    if (::geteuid() == ::getuid() && ::getegid() == ::getgid()) {
+        if (auto envPath = env.get("ENV")) {
+            std::string expanded = expandConfigWord(executor, *envPath);
+            if (!expanded.empty()) exitedDuringStartup = sourceStartupFile(expanded);
+        }
+    }
+    if (!exitedDuringStartup) {
+        if (auto home = env.get("HOME")) exitedDuringStartup = sourceStartupFile(*home + "/.ushrc");
+    }
 
     // Command history (fc, HISTFILE/HISTSIZE) lives on the executor (see
     // Executor::history()) so the `fc`/`history` built-ins can reach it
@@ -165,14 +242,16 @@ int runInteractive(ush::Environment& env, ush::Executor& executor) {
 
     std::string buffer;
     bool continuing = false;
-    int status = 0;
 
     // Every return path below falls through to here instead of returning
     // directly, so the EXIT trap (if any) always gets to run exactly once,
     // right before the session actually ends - see
-    // Executor::runExitTrapIfSet().
+    // Executor::runExitTrapIfSet(). `!exitedDuringStartup`: if `exit` was
+    // already called from $ENV/~/.ushrc above, skip straight past the
+    // loop to that same cleanup, exactly as if EOF had been read at the
+    // very first prompt.
     try {
-        while (true) {
+        while (!exitedDuringStartup) {
             // Background/stopped job state changes are reported here,
             // right before the next prompt - not asynchronously as they
             // happen - matching real shells' default behavior.

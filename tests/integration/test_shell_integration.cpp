@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -39,15 +40,22 @@ struct RunResult {
     int status;
 };
 
-// Every test process inherits the real $HOME - without setting HISTFILE
-// explicitly, an interactive run would default it to the *actual* user's
-// ~/.ush_history and load/save it for real. "/dev/null" (the default
-// here) makes history purely in-memory for the test: load() finds
-// nothing, save() writes harmlessly nowhere. A test that specifically
-// wants to exercise persistence passes a real (temp-directory) path
-// instead.
+// Every test process inherits the real $HOME (and possibly $ENV) - none
+// of this file's spawn points ever wants that: without overriding it, an
+// interactive run would default HISTFILE to the *actual* user's
+// ~/.ush_history (load/saving it for real) and, now that main.cpp
+// sources ~/.ushrc and $ENV at startup, would try to run whatever's in
+// the *real* developer's actual ~/.ushrc too. "/dev/null" (histFile's
+// default) makes history purely in-memory for the test; a nonexistent
+// homeDir (its default) makes ~/.ushrc "not found" - both harmless no-ops
+// - and $ENV is unset outright so nothing inherited from the host
+// environment gets sourced either. A test that specifically wants to
+// exercise persistence or startup-file sourcing passes a real
+// (temp-directory) path for the relevant one.
 RunResult runUshWithArgv(const std::vector<std::string>& args, const std::string& stdinContent,
-                          const std::string& histFile = "/dev/null") {
+                          const std::string& histFile = "/dev/null",
+                          const std::string& homeDir = "/nonexistent-ush-test-home",
+                          const std::string& envPath = "") {
     int outPipe[2];
     REQUIRE(::pipe(outPipe) == 0);
     int inPipe[2];
@@ -65,6 +73,12 @@ RunResult runUshWithArgv(const std::vector<std::string>& args, const std::string
         ::close(outPipe[0]);
         ::close(outPipe[1]);
         ::setenv("HISTFILE", histFile.c_str(), 1);
+        ::setenv("HOME", homeDir.c_str(), 1);
+        if (envPath.empty()) {
+            ::unsetenv("ENV");
+        } else {
+            ::setenv("ENV", envPath.c_str(), 1);
+        }
 
         std::vector<char*> argv;
         for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
@@ -116,6 +130,19 @@ RunResult runUshInteractive(const std::string& stdinScript, const std::string& h
     return runUshWithArgv({USH_BINARY_PATH, "-i"}, stdinScript, histFile);
 }
 
+// As above, but overriding $HOME instead of $HISTFILE - for tests
+// exercising ~/.ushrc sourcing specifically.
+RunResult runUshInteractiveWithHome(const std::string& stdinScript, const std::string& homeDir) {
+    return runUshWithArgv({USH_BINARY_PATH, "-i"}, stdinScript, "/dev/null", homeDir);
+}
+
+// As above, but setting $ENV - for tests exercising POSIX's $ENV startup
+// file specifically.
+RunResult runUshInteractiveWithEnv(const std::string& stdinScript, const std::string& envPath) {
+    return runUshWithArgv({USH_BINARY_PATH, "-i"}, stdinScript, "/dev/null",
+                           "/nonexistent-ush-test-home", envPath);
+}
+
 // A live `ush -i` session with its stdin/stdout as pipes the test can
 // drive incrementally - needed for job-control tests, which have to read
 // a job's announced pid from mid-session output before they can send it
@@ -124,9 +151,11 @@ RunResult runUshInteractive(const std::string& stdinScript, const std::string& h
 // the end).
 class InteractiveSession {
 public:
-    // `histFile`: see runUshWithArgv()'s identical parameter - defaults
-    // to /dev/null so this never touches the real user's ~/.ush_history.
-    explicit InteractiveSession(const std::string& histFile = "/dev/null") {
+    // `histFile`/`homeDir`: see runUshWithArgv()'s identical parameters -
+    // default to never touching the real user's ~/.ush_history or
+    // ~/.ushrc.
+    explicit InteractiveSession(const std::string& histFile = "/dev/null",
+                                 const std::string& homeDir = "/nonexistent-ush-test-home") {
         int inPipe[2], outPipe[2];
         REQUIRE(::pipe(inPipe) == 0);
         REQUIRE(::pipe(outPipe) == 0);
@@ -141,6 +170,8 @@ public:
             ::close(outPipe[0]);
             ::close(outPipe[1]);
             ::setenv("HISTFILE", histFile.c_str(), 1);
+            ::setenv("HOME", homeDir.c_str(), 1);
+            ::unsetenv("ENV");
             std::vector<std::string> args = {USH_BINARY_PATH, "-i"};
             std::vector<char*> argv;
             for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
@@ -239,11 +270,14 @@ private:
 // not just whole lines.
 class PtySession {
 public:
-    explicit PtySession(const std::string& histFile = "/dev/null") {
+    explicit PtySession(const std::string& histFile = "/dev/null",
+                         const std::string& homeDir = "/nonexistent-ush-test-home") {
         pid_ = ::forkpty(&fd_, nullptr, nullptr, nullptr);
         REQUIRE(pid_ >= 0);
         if (pid_ == 0) {
             ::setenv("HISTFILE", histFile.c_str(), 1);
+            ::setenv("HOME", homeDir.c_str(), 1);
+            ::unsetenv("ENV");
             ::setenv("TERM", "xterm", 1);
             std::vector<std::string> args = {USH_BINARY_PATH, "-i"};
             std::vector<char*> argv;
@@ -632,6 +666,85 @@ TEST_CASE("PS1's '!' is replaced with the next command's history number, '!!' wi
     // then literal "$ ") -> "echo three" (#5) -> "literal ! bang 6$ ".
     CHECK(r.output ==
           "$ [2] one\n[3] two\n[4] literal ! bang 5$ three\nliteral ! bang 6$ \n");
+}
+
+// --- startup files (~/.ushrc, $ENV) ---------------------------------------
+
+TEST_CASE("the ushrc startup file is sourced before the first interactive prompt", "[integration]") {
+    TempDir home;
+    {
+        std::ofstream rc(home.path() / ".ushrc");
+        rc << "echo ushrc-loaded\n";
+        rc << "greet() { echo \"hi $1\"; }\n";
+        rc << "GREETING=set-in-ushrc\n";
+    }
+    auto r = runUshInteractiveWithHome("greet world\necho $GREETING\n", home.path().string());
+    // All three prove the rc file ran *in the current environment* (not
+    // a subshell) before the first prompt: its own echo appears, the
+    // function it defined is callable on a later line, and the variable
+    // it set is visible on a later line too.
+    CHECK(r.output.find("ushrc-loaded") != std::string::npos);
+    CHECK(r.output.find("hi world") != std::string::npos);
+    CHECK(r.output.find("set-in-ushrc") != std::string::npos);
+}
+
+TEST_CASE("the ushrc startup file is NOT sourced for a non-interactive run", "[integration]") {
+    TempDir home;
+    {
+        std::ofstream rc(home.path() / ".ushrc");
+        rc << "echo ushrc-loaded\n";
+    }
+    auto r = runUshWithArgv({USH_BINARY_PATH, "-c", "echo hi"}, "", "/dev/null", home.path().string());
+    CHECK(r.output == "hi\n");
+    CHECK(r.output.find("ushrc-loaded") == std::string::npos);
+}
+
+TEST_CASE("a missing ~/.ushrc is not an error", "[integration]") {
+    // Every other interactive test in this file already relies on this
+    // (the default homeDir doesn't exist) - this just makes the
+    // guarantee explicit.
+    auto r = runUshInteractive("echo hi\n");
+    CHECK(r.status == 0);
+    CHECK(r.output.find("hi") != std::string::npos);
+}
+
+TEST_CASE("exit inside ~/.ushrc ends the session immediately, without reading further input",
+          "[integration]") {
+    TempDir home;
+    {
+        std::ofstream rc(home.path() / ".ushrc");
+        rc << "echo before-exit\n";
+        rc << "exit 7\n";
+        rc << "echo should-not-run\n";
+    }
+    auto r = runUshInteractiveWithHome("echo also-should-not-run\n", home.path().string());
+    CHECK(r.output == "before-exit\n");
+    CHECK(r.status == 7);
+}
+
+TEST_CASE("a syntax error in ~/.ushrc is reported but doesn't stop the shell from starting",
+          "[integration]") {
+    TempDir home;
+    {
+        std::ofstream rc(home.path() / ".ushrc");
+        rc << "if true\n";  // unterminated compound command
+    }
+    auto r = runUshInteractiveWithHome("echo still-alive\n", home.path().string());
+    CHECK(r.output.find("syntax error") != std::string::npos);
+    CHECK(r.output.find("still-alive") != std::string::npos);
+}
+
+TEST_CASE("$ENV is sourced for interactive shells before ~/.ushrc", "[integration]") {
+    TempDir dir;
+    fs::path envFile = dir.path() / "envfile.sh";
+    {
+        std::ofstream f(envFile);
+        f << "echo env-loaded\n";
+        f << "WHO=env\n";
+    }
+    auto r = runUshInteractiveWithEnv("echo $WHO\n", envFile.string());
+    CHECK(r.output.find("env-loaded") != std::string::npos);
+    CHECK(r.output.find("env\n") != std::string::npos);
 }
 
 TEST_CASE("passing -i together with -c just runs non-interactively (documented simplification)",

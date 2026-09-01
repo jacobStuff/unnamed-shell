@@ -45,6 +45,11 @@ real line editor on an actual terminal: cursor movement (arrow keys,
 `Ctrl-L` to redraw), and history recall (arrow keys or `Ctrl-P`/`Ctrl-N`,
 backed by a real history list - `fc`, `history`, `HISTFILE`/`HISTSIZE`).
 `Ctrl-C` aborts the line you're typing rather than the shell itself.
+Before the first prompt, ush sources POSIX's `$ENV` file and then its
+own `~/.ushrc` (not POSIX - the same convention bash's `~/.bashrc` and
+zsh's `~/.zshrc` follow) in the current environment, so variables and
+functions set there are available for the rest of the session; either
+is silently skipped if missing.
 
 ## Status
 
@@ -67,7 +72,7 @@ history. Built-ins: every POSIX special built-in, plus a practical
 regular set - `cd`, `pwd`, `echo`, `printf`, `read`, `test`/`[`, `true`,
 `false`, `command`, `type`, `getopts`, `wait`, `umask`, `kill`, `jobs`,
 `fg`, `bg`, `fc` (list/edit-and-reexecute/quick-reexecute a range of
-history), `history`. Done and tested: 1031 assertions across 206 cases,
+history), `history`. Done and tested: 1062 assertions across 212 cases,
 including integration tests that run the actual built binary end to end
 (interactively too, via `-i` and, for the line editor specifically, over
 a real pseudo-terminal - sending real signals, including to interrupt a
