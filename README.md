@@ -21,6 +21,20 @@ ctest --test-dir build --output-on-failure
 
 To build without tests: `cmake -S . -B build -DUSH_BUILD_TESTS=OFF`.
 
+## Installing
+
+```bash
+brew install --HEAD --formula Formula/ush.rb   # Homebrew, builds from source
+```
+
+Prebuilt packages (a `.pkg` for macOS, `.deb`/`.rpm` for Linux, plus a
+plain `.tar.gz` for either) are attached to
+[GitHub Releases](https://github.com/jacobStuff/unnamed-shell/releases)
+for every tagged version. See [docs/PACKAGING.md](docs/PACKAGING.md) for
+how each of these is built, how to build one yourself
+(`cmake --install`/`cpack`), and how to test a package locally before
+trusting it.
+
 ## Running
 
 ```bash

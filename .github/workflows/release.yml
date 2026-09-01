@@ -1,0 +1,46 @@
+name: Release
+
+# Builds ush's packages (a .pkg + .tar.gz on macOS, .deb + .rpm + .tar.gz
+# on Linux) and attaches them to a GitHub Release whenever a version tag
+# (v1.2.3) is pushed - see docs/PACKAGING.md for how each format is put
+# together (CMake's install() + CPack, configured in the top-level
+# CMakeLists.txt) and how to test one locally before cutting a real tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-14, ubuntu-latest]  # macos-14: Apple Silicon runner -
+                                        # matches the arm64 binaries this
+                                        # project actually ships/tests on
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # dpkg-deb (for CPack's DEB generator) ships with every Debian/
+      # Ubuntu system already; rpmbuild (for the RPM generator) doesn't
+      # and has to be installed explicitly.
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - name: Configure
+        run: cmake -S . -B build -DUSH_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Package
+        working-directory: build
+        run: cpack
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/ush-*
+          fail_on_unmatched_files: true

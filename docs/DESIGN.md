@@ -770,8 +770,31 @@ expansion stage can detect by inspecting the first `Literal` part directly.
        hard-corners note on why every one of these helpers sets
        `HISTFILE=/dev/null` (or a throwaway temp path) rather than
        leaving it unset.
+10. [x] Packaging (top-level `CMakeLists.txt`'s `install()`/CPack
+        config, `Formula/ush.rb`, `.github/workflows/release.yml`) - see
+        [docs/PACKAGING.md](PACKAGING.md) for the full picture (how to
+        build/test each format locally, how to cut a release, how to
+        publish the Homebrew formula properly). Two real bugs found
+        while setting this up, both from testing every package's actual
+        payload rather than trusting that CPack "just worked" because it
+        exited 0:
+        - CPack's macOS `productbuild` generator defaults to installing
+          under `/Applications` - fine for a `.app` bundle, useless for
+          a CLI tool (the binary landed at `/Applications/bin/ush`,
+          nowhere near `$PATH`, and `cpack` printed no warning about it).
+          Fixed with an explicit `CPACK_PACKAGING_INSTALL_PREFIX
+          "/usr/local"`. Caught by `pkgutil --expand-full`-ing the
+          actual `.pkg` and looking at the payload path, not by cpack's
+          own exit status.
+        - The same generator rejects a `.md` license file outright
+          ("Bad file extension specified... only .rtfd, .rtf, .html,
+          and .txt files allowed"), which stopped the `.pkg` from
+          building at all. Fixed by `configure_file(... COPYONLY)`-ing a
+          `.txt` copy of `LICENSE.md` into the build tree at configure
+          time and pointing every generator at that instead of
+          branching per-platform.
 
-Items 1-9 above are all now at least minimally done; "broad POSIX from
+Items 1-10 above are all now at least minimally done; "broad POSIX from
 the start" meant the *architecture* supported the full grammar/expansion/
 execution model from day one, and it has - what's left is breadth within
 each piece (a couple of niche built-ins, completion, a real vi editing
