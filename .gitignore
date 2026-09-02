@@ -9,3 +9,4 @@ compile_commands.json
 .DS_Store
 CTestTestfile.cmake
 _deps/
+.env
